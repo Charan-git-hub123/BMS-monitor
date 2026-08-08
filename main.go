@@ -1,16 +1,28 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
-// UserState tracking categories
+// ================= CONFIGURATION =================
+// You can set these in Render Environment Variables or replace them directly here
+var (
+	TwilioAccountSID = getEnv("TWILIO_ACCOUNT_SID", "YOUR_TWILIO_ACCOUNT_SID")
+	TwilioAuthToken  = getEnv("TWILIO_AUTH_TOKEN", "YOUR_TWILIO_AUTH_TOKEN")
+	TwilioFromNumber = getEnv("TWILIO_FROM_NUMBER", "whatsapp:+14155238886")
+)
+
 type ChatState string
 
 const (
@@ -24,7 +36,6 @@ const (
 	StateMonitoring        ChatState = "MONITORING"
 )
 
-// Session holds the collection criteria for the active scraper task
 type UserSession struct {
 	CurrentState ChatState
 	City         string
@@ -33,15 +44,14 @@ type UserSession struct {
 	Theater      string
 	Time         string
 	Frequency    time.Duration
+	TargetURL    string
 }
 
 var (
-	// Thread-safe map to store conversation histories
 	sessionStore = make(map[string]*UserSession)
 	sessionMutex sync.Mutex
 )
 
-// Incoming Twilio/Meta standard webhook format wrapper
 type WebhookPayload struct {
 	From string `json:"From"`
 	Body string `json:"Body"`
@@ -49,21 +59,24 @@ type WebhookPayload struct {
 
 func main() {
 	http.HandleFunc("/whatsapp", handleWhatsAppIncoming)
-	
-	log.Println("BMS Chatbot Server running on port 8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("BMS Monitor Engine listening on :%s...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func handleWhatsAppIncoming(w http.ResponseWriter, r *http.Request) {
-	// Parse input variables (handles form parameters or JSON payloads depending on your sandbox provider)
 	r.ParseForm()
 	fromUser := r.FormValue("From")
 	msgBody := strings.TrimSpace(r.FormValue("Body"))
 
 	if fromUser == "" {
-		// Fallback for raw JSON direct testing
 		var p WebhookPayload
 		if err := json.NewDecoder(r.Body).Decode(&p); err == nil {
 			fromUser = p.From
@@ -81,14 +94,13 @@ func handleWhatsAppIncoming(w http.ResponseWriter, r *http.Request) {
 
 	responseMessage := processState(fromUser, session, msgBody)
 
-	// Reply back through the HTTP protocol format
 	w.Header().Set("Content-Type", "application/xml")
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Response><Message>%s</Message></Response>`, responseMessage)
 }
 
 func processState(user string, session *UserSession, input string) string {
 	switch session.CurrentState {
-	
+
 	case StateStart:
 		session.CurrentState = StateAwaitingCity
 		return "Welcome to BMS Monitor! 🎬\n\nPlease enter your city name (e.g., Hyderabad, Mumbai) to find what's playing nearby:"
@@ -96,28 +108,28 @@ func processState(user string, session *UserSession, input string) string {
 	case StateAwaitingCity:
 		session.City = input
 		session.CurrentState = StateAwaitingMovie
-		// TODO: Hook up a quick server-side request to check what movies are available in this city
-		return fmt.Sprintf("📍 Location set to: %s.\n\nHere are the top trending movies. Please reply with the exact name:\n1. Kalki 2898 AD\n2. Indian 2\n3. Devara", session.City)
+		return fmt.Sprintf("📍 Location set to: %s.\n\nType the exact movie name you want to watch:", session.City)
 
 	case StateAwaitingMovie:
 		session.Movie = input
 		session.CurrentState = StateAwaitingDate
-		// TODO: Extract the active release dates from the target show catalog
-		return fmt.Sprintf("Selected Movie: %s 🎥\n\nWhen would you like to watch? Reply with one of these dates:\n- 2026-07-19 (Sunday)\n- 2026-07-20 (Monday)", session.Movie)
+		return fmt.Sprintf("Selected Movie: %s 🎥\n\nWhen would you like to watch? Reply with date (YYYYMMDD, e.g. 20260718):", session.Movie)
 
 	case StateAwaitingDate:
 		session.Date = input
 		session.CurrentState = StateAwaitingTheater
-		return "Got it. Select your preferred cinema by replying with the choice name:\n1. AMB Cinemas: Gachibowli\n2. INOX: Sattva Necklace Mall\n3. Prasads Multiplex"
+		return "Select your preferred cinema / theater name or venue code:"
 
 	case StateAwaitingTheater:
 		session.Theater = input
 		session.CurrentState = StateAwaitingTime
-		return "Available Showtimes:\n- 11:30 AM\n- 02:45 PM\n- 07:15 PM\n- 10:30 PM\n\nPlease type your target time choice exactly:"
+		return "Available Showtimes (e.g., 07:15 PM):\n\nPlease type your target time choice:"
 
 	case StateAwaitingTime:
 		session.Time = input
 		session.CurrentState = StateAwaitingFrequency
+		// Target layout URL generated dynamically based on session date
+		session.TargetURL = "https://in.bookmyshow.com/movies/hyd/seat-layout/ET00441159/AMBH/115212/" + session.Date
 		return "Perfect. Final step: how often do you want updates sent to your phone?\n\nReply with a number in minutes (e.g., type 15 or 30):"
 
 	case StateAwaitingFrequency:
@@ -126,19 +138,18 @@ func processState(user string, session *UserSession, input string) string {
 		if err != nil || mins <= 0 {
 			return "Please enter a valid positive number for the tracking frequency (e.g., 30):"
 		}
-		
+
 		session.Frequency = time.Duration(mins) * time.Minute
 		session.CurrentState = StateMonitoring
-		
-		// Start background task loop
+
 		go startBackgroundMonitor(user, session)
-		
-		return fmt.Sprintf("✅ Configuration Complete!\n\nBMS Monitor has successfully locked onto your screening selection. I will scrape the live theater seating map and send visual updates straight here every %d minutes.", mins)
+
+		return fmt.Sprintf("✅ Configuration Complete!\n\nBMS Monitor is actively scraping seat availability for %s every %d minutes.", session.Movie, mins)
 
 	case StateMonitoring:
-		return "I am currently monitoring your target showtime! If you want to reset parameters or build a new session, simply type 'restart'."
+		return "I am currently monitoring your target showtime! Type 'restart' anytime to build a new session."
 	}
-	
+
 	return "System Error. Type 'restart' to return to step one."
 }
 
@@ -147,12 +158,10 @@ func startBackgroundMonitor(user string, session *UserSession) {
 	defer ticker.Stop()
 
 	log.Printf("[+] Starting background tracker loop for user %s every %v", user, session.Frequency)
-	
-	// Fire immediately on initialization
+
 	triggerScrapeAndSend(user, session)
 
 	for range ticker.C {
-		// Check if user wiped configuration state out-of-band
 		sessionMutex.Lock()
 		currentSession, exists := sessionStore[user]
 		if !exists || currentSession.CurrentState != StateMonitoring {
@@ -167,11 +176,159 @@ func startBackgroundMonitor(user string, session *UserSession) {
 }
 
 func triggerScrapeAndSend(user string, session *UserSession) {
-	log.Printf("[Scraper] Running Chromedp engine cycle for showtime setup: %s | %s", session.Theater, session.Time)
-	
-	// TODO: Wire our working main.go canvas layout coordinator logic right here to fetch the emoji grid string
-	dummyMap := "```\nA: 🟥 🟥 ⬜ 🟩 🟩 🟩 🟩 ⬜ 🟥 🟥\nB: 🟥 🟥 ⬜ 🟩 🟩 🟥 🟩 ⬜ 🟥 🟥\n```"
-	
-	// Send message block layout out via Twilio/Meta API call here
-	fmt.Printf("[NOTIFICATION TO USER %s]:\n🚨 Live Seating update for %s:\n%s\n", user, session.Movie, dummyMap)
+	log.Printf("[Scraper] Running Chromedp engine cycle for: %s | %s", session.Theater, session.Time)
+
+	// Fetch live canvas string from Chromedp engine
+	matrixStr := fetchCanvasMatrix(session.TargetURL)
+
+	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
+		session.Movie, session.Theater, session.Time, matrixStr)
+
+	// Dispatch outbound message to user via Twilio API
+	sendTwilioWhatsAppMessage(user, formattedMsg)
+}
+
+// ================= CHROMEDP ENGINE WITH DOCKER FLAGS =================
+func fetchCanvasMatrix(targetURL string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	// HERE ARE THE REQUIRED DOCKER & CLOUD SERVING FLAGS:
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),             // Required for Linux/Render environments
+		chromedp.Flag("disable-dev-shm-usage", true),  // Prevents memory crash on Docker
+	)
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
+	defer cancelAlloc()
+
+	ctx, cancelCtx := chromedp.NewContext(allocCtx)
+	defer cancelCtx()
+
+	var finalMatrix string
+
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(targetURL),
+		chromedp.Sleep(7*time.Second),
+
+		chromedp.Evaluate(`(() => {
+			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
+				return "ERROR: Canvas stage not initialized yet.";
+			}
+
+			let stage = window.Konva.stages[0];
+			let rows = {};
+			let tiers = [];
+
+			let textNodes = stage.find('Text');
+			textNodes.forEach(t => {
+				let textStr = (t.attrs.text || "").trim();
+				if (textStr && (textStr.includes('₹') || textStr.includes('Rs.') || textStr.length > 8)) {
+					if (!textStr.includes(':') && !textStr.match(/^\d+$/) && !textStr.includes('Pay')) {
+						tiers.push({ y: t.attrs.y, name: textStr.toUpperCase() });
+					}
+				}
+			});
+
+			tiers.sort((a, b) => a.y - b.y);
+
+			let rectShapes = stage.find('Rect');
+			rectShapes.forEach(shape => {
+				let attrs = shape.attrs || {};
+				if (attrs.width === 22 && attrs.height === 22) {
+					let yKey = attrs.y; 
+					let fill = String(attrs.fill || "").toUpperCase();
+					
+					if (!rows[yKey]) rows[yKey] = [];
+
+					if (fill === '#E5E5E5' || fill === 'E5E5E5') {
+						rows[yKey].push({ x: attrs.x, emoji: "🟥" });
+					} else {
+						rows[yKey].push({ x: attrs.x, emoji: "🟩" });
+					}
+				}
+			});
+
+			let sortedY = Object.keys(rows).sort((a, b) => Number(a) - Number(b));
+			let output = "";
+			let currentTierIndex = 0;
+			let rowLabelChar = 65;
+
+			sortedY.forEach(y => {
+				let rowYNum = Number(y);
+
+				while (currentTierIndex < tiers.length && rowYNum > tiers[currentTierIndex].y) {
+					output += "\n✨ --- " + tiers[currentTierIndex].name + " --- ✨\n";
+					currentTierIndex++;
+				}
+
+				let seatRow = rows[y];
+				seatRow.sort((a, b) => a.x - b.x);
+				
+				let rowString = String.fromCharCode(rowLabelChar) + ": ";
+				let prevX = null;
+
+				seatRow.forEach(seat => {
+					if (prevX !== null) {
+						let diff = seat.x - prevX;
+						if (diff > 35) {
+							let emptySlots = Math.max(1, Math.round(diff / 26) - 1);
+							for (let i = 0; i < emptySlots; i++) {
+								rowString += "⬜ "; 
+							}
+						}
+					}
+					rowString += seat.emoji + " ";
+					prevX = seat.x;
+				});
+				
+				output += rowString + "\n";
+				rowLabelChar++;
+			});
+
+			return output || "ERROR: Could not compile canvas layout elements.";
+		})()`, &finalMatrix),
+	)
+
+	if err != nil {
+		return fmt.Sprintf("Scraper Error: %v", err)
+	}
+
+	return finalMatrix
+}
+
+func sendTwilioWhatsAppMessage(toUser string, messageText string) {
+	if TwilioAccountSID == "YOUR_TWILIO_ACCOUNT_SID" {
+		log.Println("[Warning] Twilio credentials not configured. Outputting to console instead.")
+		log.Printf("[OUTBOUND TO %s]:\n%s", toUser, messageText)
+		return
+	}
+
+	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", TwilioAccountSID)
+
+	data := url.Values{}
+	data.Set("From", TwilioFromNumber)
+	data.Set("To", toUser)
+	data.Set("Body", messageText)
+
+	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
+	req.SetBasicAuth(TwilioAccountSID, TwilioAuthToken)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[-] Failed to deliver Twilio payload: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("[+] Sent WhatsApp update to %s (Status: %s)", toUser, resp.Status)
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }
