@@ -1,0 +1,12 @@
+# Go binaries
+bms-monitor
+bms-monitor.exe
+*.exe
+
+# Environment files with secrets
+.env
+
+# OS / IDE files
+.DS_Store
+.vscode/
+.idea/
