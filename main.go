@@ -16,7 +16,6 @@ import (
 )
 
 // ================= CONFIGURATION =================
-// You can set these in Render Environment Variables or replace them directly here
 var (
 	TwilioAccountSID = getEnv("TWILIO_ACCOUNT_SID", "YOUR_TWILIO_ACCOUNT_SID")
 	TwilioAuthToken  = getEnv("TWILIO_AUTH_TOKEN", "YOUR_TWILIO_AUTH_TOKEN")
@@ -26,14 +25,14 @@ var (
 type ChatState string
 
 const (
-	StateStart             ChatState = "START"
-	StateAwaitingCity      ChatState = "AWAITING_CITY"
-	StateAwaitingMovie     ChatState = "AWAITING_MOVIE"
-	StateAwaitingDate      ChatState = "AWAITING_DATE"
-	StateAwaitingTheater   ChatState = "AWAITING_THEATER"
-	StateAwaitingTime      ChatState = "AWAITING_TIME"
+	StateStart            ChatState = "START"
+	StateAwaitingCity     ChatState = "AWAITING_CITY"
+	StateAwaitingMovie    ChatState = "AWAITING_MOVIE"
+	StateAwaitingDate     ChatState = "AWAITING_DATE"
+	StateAwaitingTheater  ChatState = "AWAITING_THEATER"
+	StateAwaitingTime     ChatState = "AWAITING_TIME"
 	StateAwaitingFrequency ChatState = "AWAITING_FREQUENCY"
-	StateMonitoring        ChatState = "MONITORING"
+	StateMonitoring       ChatState = "MONITORING"
 )
 
 type UserSession struct {
@@ -128,7 +127,6 @@ func processState(user string, session *UserSession, input string) string {
 	case StateAwaitingTime:
 		session.Time = input
 		session.CurrentState = StateAwaitingFrequency
-		// Target layout URL generated dynamically based on session date
 		session.TargetURL = "https://in.bookmyshow.com/movies/hyd/seat-layout/ET00441159/AMBH/115212/" + session.Date
 		return "Perfect. Final step: how often do you want updates sent to your phone?\n\nReply with a number in minutes (e.g., type 15 or 30):"
 
@@ -178,37 +176,30 @@ func startBackgroundMonitor(user string, session *UserSession) {
 func triggerScrapeAndSend(user string, session *UserSession) {
 	log.Printf("[Scraper] Running Chromedp engine cycle for: %s | %s", session.Theater, session.Time)
 
-	// Fetch live canvas string from Chromedp engine
 	matrixStr := fetchCanvasMatrix(session.TargetURL)
+
+	// Truncate payload if text exceeds maximum WhatsApp message size
+	if len(matrixStr) > 1200 {
+		matrixStr = matrixStr[:1200] + "\n...[truncated]"
+	}
 
 	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
 		session.Movie, session.Theater, session.Time, matrixStr)
 
-	// Dispatch outbound message to user via Twilio API
 	sendTwilioWhatsAppMessage(user, formattedMsg)
 }
 
-// ================= CHROMEDP ENGINE WITH DOCKER FLAGS =================
 func fetchCanvasMatrix(targetURL string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancelTimeout()
 
-	// HERE ARE THE REQUIRED DOCKER & CLOUD SERVING FLAGS:
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),             // Required for Linux/Render environments
-		chromedp.Flag("disable-dev-shm-usage", true),  // Prevents memory crash on Docker
-	)
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancelAlloc()
-
-	ctx, cancelCtx := chromedp.NewContext(allocCtx)
-	defer cancelCtx()
+	// Connect context with Docker-compatible Chromium flags
+	taskCtx, cancelChrome := createChromeContext(ctx)
+	defer cancelChrome()
 
 	var finalMatrix string
 
-	err := chromedp.Run(ctx,
+	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(targetURL),
 		chromedp.Sleep(7*time.Second),
 
@@ -305,11 +296,23 @@ func sendTwilioWhatsAppMessage(toUser string, messageText string) {
 		return
 	}
 
+	// Ensure recipient phone number format includes 'whatsapp:' prefix
+	formattedTo := toUser
+	if !strings.HasPrefix(formattedTo, "whatsapp:") {
+		formattedTo = "whatsapp:" + formattedTo
+	}
+
+	// Ensure sender phone number format includes 'whatsapp:' prefix
+	formattedFrom := TwilioFromNumber
+	if !strings.HasPrefix(formattedFrom, "whatsapp:") {
+		formattedFrom = "whatsapp:" + formattedFrom
+	}
+
 	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", TwilioAccountSID)
 
 	data := url.Values{}
-	data.Set("From", TwilioFromNumber)
-	data.Set("To", toUser)
+	data.Set("From", formattedFrom)
+	data.Set("To", formattedTo)
 	data.Set("Body", messageText)
 
 	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
@@ -323,33 +326,30 @@ func sendTwilioWhatsAppMessage(toUser string, messageText string) {
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("[+] Sent WhatsApp update to %s (Status: %s)", toUser, resp.Status)
+	log.Printf("[+] Sent WhatsApp update to %s (Status: %s)", formattedTo, resp.Status)
 }
+
 func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
-	// 1. Fetch CHROME_PATH set by Dockerfile, or fallback to default
 	execPath := os.Getenv("CHROME_PATH")
 	if execPath == "" {
 		execPath = "/usr/bin/chromium-browser"
 	}
 
-	// 2. Set essential flags for running Headless Chrome inside Docker
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(execPath),
 		chromedp.NoFirstRun,
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.Headless,
 		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),                 // Required for Docker
-		chromedp.Flag("disable-setuid-sandbox", true),      // Required for Docker
-		chromedp.Flag("disable-dev-shm-usage", true),       // Prevents shared memory crashes in Docker
-		chromedp.Flag("single-process", true),              // Helps manage memory on free tiers
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("single-process", true),
 	)
 
-	// 3. Create allocator & execution context
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parentCtx, opts...)
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 
-	// Combine cancels into a single cleanup function
 	cancel := func() {
 		cancelTask()
 		cancelAlloc()
