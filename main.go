@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io" // Added io import for reading response body
 	"log"
 	"net/http"
 	"net/url"
@@ -178,9 +179,10 @@ func triggerScrapeAndSend(user string, session *UserSession) {
 
 	matrixStr := fetchCanvasMatrix(session.TargetURL)
 
-	// Truncate payload if text exceeds maximum WhatsApp message size
-	if len(matrixStr) > 1200 {
-		matrixStr = matrixStr[:1200] + "\n...[truncated]"
+	// Safe Unicode (Rune) Truncation to prevent invalid UTF-8 byte corruption
+	runes := []rune(matrixStr)
+	if len(runes) > 500 {
+		matrixStr = string(runes[:500]) + "\n...[truncated]"
 	}
 
 	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
@@ -326,7 +328,10 @@ func sendTwilioWhatsAppMessage(toUser string, messageText string) {
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("[+] Sent WhatsApp update to %s (Status: %s)", formattedTo, resp.Status)
+
+	// Read and log full response body from Twilio for debugging
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[+] Twilio Response (Status %s): %s", resp.Status, string(respBody))
 }
 
 func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
