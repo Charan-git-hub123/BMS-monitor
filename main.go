@@ -298,31 +298,24 @@ func sendTwilioWhatsAppMessage(toUser string, messageText string) {
 		return
 	}
 
-	formattedTo := toUser
+	// Clean up leading/trailing spaces
+	formattedTo := strings.TrimSpace(toUser)
+	formattedFrom := strings.TrimSpace(TwilioFromNumber)
+
+	// Strictly ensure 'whatsapp:' prefix is attached
 	if !strings.HasPrefix(formattedTo, "whatsapp:") {
 		formattedTo = "whatsapp:" + formattedTo
 	}
-
-	formattedFrom := TwilioFromNumber
 	if !strings.HasPrefix(formattedFrom, "whatsapp:") {
 		formattedFrom = "whatsapp:" + formattedFrom
 	}
 
 	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", TwilioAccountSID)
 
-	// Create JSON variables for the default Twilio WhatsApp Sandbox template
-	// Template expects: {"1": "your_custom_text_here"}
-	varsJSON, _ := json.Marshal(map[string]string{
-		"1": messageText,
-	})
-
 	data := url.Values{}
 	data.Set("From", formattedFrom)
 	data.Set("To", formattedTo)
-	
-	// Twilio's standard free sandbox ContentSid for outbound templates:
-	data.Set("ContentSid", "HXb5b62575e6e4ff6129ad7c8efe1f983e")
-	data.Set("ContentVariables", string(varsJSON))
+	data.Set("Body", messageText)
 
 	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
 	req.SetBasicAuth(TwilioAccountSID, TwilioAuthToken)
