@@ -325,6 +325,38 @@ func sendTwilioWhatsAppMessage(toUser string, messageText string) {
 	defer resp.Body.Close()
 	log.Printf("[+] Sent WhatsApp update to %s (Status: %s)", toUser, resp.Status)
 }
+func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
+	// 1. Fetch CHROME_PATH set by Dockerfile, or fallback to default
+	execPath := os.Getenv("CHROME_PATH")
+	if execPath == "" {
+		execPath = "/usr/bin/chromium-browser"
+	}
+
+	// 2. Set essential flags for running Headless Chrome inside Docker
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(execPath),
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.Headless,
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),                 // Required for Docker
+		chromedp.Flag("disable-setuid-sandbox", true),      // Required for Docker
+		chromedp.Flag("disable-dev-shm-usage", true),       // Prevents shared memory crashes in Docker
+		chromedp.Flag("single-process", true),              // Helps manage memory on free tiers
+	)
+
+	// 3. Create allocator & execution context
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parentCtx, opts...)
+	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
+
+	// Combine cancels into a single cleanup function
+	cancel := func() {
+		cancelTask()
+		cancelAlloc()
+	}
+
+	return taskCtx, cancel
+}
 
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
