@@ -170,6 +170,9 @@ func main() {
 }
 
 func handleWhatsAppEvent(evt interface{}) {
+	// DEBUG: Log every single event type that arrives from WhatsApp
+	log.Printf("[DEBUG EVENT RECEIVED] Type: %T", evt)
+
 	switch v := evt.(type) {
 	case *events.PairSuccess:
 		log.Printf("[+] Device successfully linked: %s", v.ID.String())
@@ -181,15 +184,17 @@ func handleWhatsAppEvent(evt interface{}) {
 		log.Println("[+] WhatsApp WebSocket connection active.")
 
 	case *events.Message:
-		if v.Info.IsFromMe {
-			return
+		// Let's print out who sent it and what the message is, regardless of 'IsFromMe'
+		sender := v.Info.Sender.String()
+		text := v.Message.GetConversation()
+		if text == "" && v.Message.GetExtendedTextMessage() != nil {
+			text = v.Message.GetExtendedTextMessage().GetText()
 		}
+		log.Printf("[INCOMING MESSAGE] From: %s | Text: '%s' | IsFromMe: %v", sender, text, v.Info.IsFromMe)
 
+		// If messaging yourself from the linked phone, allow it for testing purposes
 		userJID := v.Info.Sender.ToNonAD().String()
-		msgText := strings.TrimSpace(v.Message.GetConversation())
-		if msgText == "" && v.Message.GetExtendedTextMessage() != nil {
-			msgText = strings.TrimSpace(v.Message.GetExtendedTextMessage().GetText())
-		}
+		msgText := strings.TrimSpace(text)
 		if msgText == "" {
 			return
 		}
