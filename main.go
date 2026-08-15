@@ -2,38 +2,42 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io" // Added io import for reading response body
 	"log"
+	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/chromedp/chromedp"
-)
+	_ "github.com/lib/pq"
+	"github.com/mdp/qrterminal/v3"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 
-// ================= CONFIGURATION =================
-var (
-	TwilioAccountSID = getEnv("TWILIO_ACCOUNT_SID", "YOUR_TWILIO_ACCOUNT_SID")
-	TwilioAuthToken  = getEnv("TWILIO_AUTH_TOKEN", "YOUR_TWILIO_AUTH_TOKEN")
-	TwilioFromNumber = getEnv("TWILIO_FROM_NUMBER", "whatsapp:+14155238886")
+	"github.com/chromedp/chromedp"
 )
 
 type ChatState string
 
 const (
-	StateStart            ChatState = "START"
-	StateAwaitingCity     ChatState = "AWAITING_CITY"
-	StateAwaitingMovie    ChatState = "AWAITING_MOVIE"
-	StateAwaitingDate     ChatState = "AWAITING_DATE"
-	StateAwaitingTheater  ChatState = "AWAITING_THEATER"
-	StateAwaitingTime     ChatState = "AWAITING_TIME"
+	StateStart             ChatState = "START"
+	StateAwaitingCity      ChatState = "AWAITING_CITY"
+	StateAwaitingMovie     ChatState = "AWAITING_MOVIE"
+	StateAwaitingDate      ChatState = "AWAITING_DATE"
+	StateAwaitingTheater   ChatState = "AWAITING_THEATER"
+	StateAwaitingTime      ChatState = "AWAITING_TIME"
 	StateAwaitingFrequency ChatState = "AWAITING_FREQUENCY"
-	StateMonitoring       ChatState = "MONITORING"
+	StateMonitoring        ChatState = "MONITORING"
 )
 
 type UserSession struct {
@@ -50,55 +54,109 @@ type UserSession struct {
 var (
 	sessionStore = make(map[string]*UserSession)
 	sessionMutex sync.Mutex
+	waClient     *whatsmeow.Client
 )
 
-type WebhookPayload struct {
-	From string `json:"From"`
-	Body string `json:"Body"`
-}
-
 func main() {
-	http.HandleFunc("/whatsapp", handleWhatsAppIncoming)
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
 
+	// 1. Initialize Supabase SQL Store for session persistence
+	dbLog := waLog.Stdout("Database", "ERROR", true)
+	container, err := sqlstore.New("postgres", dbURL, dbLog)
+	if err != nil {
+		log.Fatalf("Failed to connect to Supabase: %v", err)
+	}
+
+	deviceStore, err := container.GetFirstDevice()
+	if err != nil {
+		log.Fatalf("Failed to fetch device store: %v", err)
+	}
+
+	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
+	waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	waClient.AddEventHandler(handleWhatsAppEvent)
+
+	// 2. Pair with QR Code if not already logged in
+	if waClient.Store.ID == nil {
+		qrChan, _ := waClient.GetQRChannel(context.Background())
+		err = waClient.Connect()
+		if err != nil {
+			log.Fatalf("Failed to connect to WhatsApp: %v", err)
+		}
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				log.Println("Scan the QR code below from WhatsApp (Linked Devices):")
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			} else {
+				log.Println("QR Channel Event:", evt.Event)
+			}
+		}
+	} else {
+		err = waClient.Connect()
+		if err != nil {
+			log.Fatalf("Failed to reconnect WhatsApp: %v", err)
+		}
+		log.Println("WhatsApp client reconnected using existing Supabase session.")
+	}
+
+	// 3. Render HTTP Health Check server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-
-	log.Printf("BMS Monitor Engine listening on :%s...", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func handleWhatsAppIncoming(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	fromUser := r.FormValue("From")
-	msgBody := strings.TrimSpace(r.FormValue("Body"))
-
-	if fromUser == "" {
-		var p WebhookPayload
-		if err := json.NewDecoder(r.Body).Decode(&p); err == nil {
-			fromUser = p.From
-			msgBody = strings.TrimSpace(p.Body)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "BMS Monitor WhatsApp Engine is running.")
+	})
+	go func() {
+		log.Printf("Health server listening on :%s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("HTTP server terminated: %v", err)
 		}
-	}
+	}()
 
-	sessionMutex.Lock()
-	session, exists := sessionStore[fromUser]
-	if !exists || strings.ToLower(msgBody) == "hi" || strings.ToLower(msgBody) == "restart" {
-		session = &UserSession{CurrentState: StateStart}
-		sessionStore[fromUser] = session
-	}
-	sessionMutex.Unlock()
+	// Graceful shutdown handling
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 
-	responseMessage := processState(fromUser, session, msgBody)
-
-	w.Header().Set("Content-Type", "application/xml")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Response><Message>%s</Message></Response>`, responseMessage)
+	waClient.Disconnect()
+	log.Println("Shutting down gracefully...")
 }
 
-func processState(user string, session *UserSession, input string) string {
+func handleWhatsAppEvent(evt interface{}) {
+	switch v := evt.(type) {
+	case *events.Message:
+		if v.Info.IsFromMe {
+			return
+		}
+
+		userJID := v.Info.Sender.ToNonAD().String()
+		msgText := strings.TrimSpace(v.Message.GetConversation())
+		if msgText == "" && v.Message.GetExtendedTextMessage() != nil {
+			msgText = strings.TrimSpace(v.Message.GetExtendedTextMessage().GetText())
+		}
+		if msgText == "" {
+			return
+		}
+
+		sessionMutex.Lock()
+		session, exists := sessionStore[userJID]
+		if !exists || strings.ToLower(msgText) == "hi" || strings.ToLower(msgText) == "restart" {
+			session = &UserSession{CurrentState: StateStart}
+			sessionStore[userJID] = session
+		}
+		sessionMutex.Unlock()
+
+		reply := processState(userJID, session, msgText)
+		sendWhatsAppMessage(v.Info.Sender.ToNonAD(), reply)
+	}
+}
+
+func processState(userJID string, session *UserSession, input string) string {
 	switch session.CurrentState {
 
 	case StateStart:
@@ -129,73 +187,93 @@ func processState(user string, session *UserSession, input string) string {
 		session.Time = input
 		session.CurrentState = StateAwaitingFrequency
 		session.TargetURL = "https://in.bookmyshow.com/movies/hyd/seat-layout/ET00441159/AMBH/115212/" + session.Date
-		return "Perfect. Final step: how often do you want updates sent to your phone?\n\nReply with a number in minutes (e.g., type 15 or 30):"
+		return "Perfect. Final step: how often do you want updates sent to your phone?\n\nReply with a number in minutes (e.g., type 5, 15, or 30):"
 
 	case StateAwaitingFrequency:
-		var mins int
-		_, err := fmt.Sscanf(input, "%d", &mins)
+		mins, err := strconv.Atoi(input)
 		if err != nil || mins <= 0 {
-			return "Please enter a valid positive number for the tracking frequency (e.g., 30):"
+			return "Please enter a valid positive number for the tracking frequency in minutes (e.g., 15):"
 		}
 
 		session.Frequency = time.Duration(mins) * time.Minute
 		session.CurrentState = StateMonitoring
 
-		go startBackgroundMonitor(user, session)
+		targetJID, _ := types.ParseJID(userJID)
+		go startBackgroundMonitor(targetJID, userJID, session)
 
-		return fmt.Sprintf("✅ Configuration Complete!\n\nBMS Monitor is actively scraping seat availability for %s every %d minutes.", session.Movie, mins)
+		return fmt.Sprintf("✅ Configuration Complete!\n\nBMS Monitor is actively tracking seat availability for %s with randomized anti-detection intervals.", session.Movie)
 
 	case StateMonitoring:
-		return "I am currently monitoring your target showtime! Type 'restart' anytime to build a new session."
+		return "I am currently monitoring your target showtime! Type 'restart' anytime to start over."
 	}
 
 	return "System Error. Type 'restart' to return to step one."
 }
 
-func startBackgroundMonitor(user string, session *UserSession) {
-	ticker := time.NewTicker(session.Frequency)
-	defer ticker.Stop()
+func startBackgroundMonitor(targetJID types.JID, userKey string, session *UserSession) {
+	log.Printf("[+] Starting background tracker loop for user %s with base frequency %v", userKey, session.Frequency)
 
-	log.Printf("[+] Starting background tracker loop for user %s every %v", user, session.Frequency)
+	// Immediate first run
+	triggerScrapeAndSend(targetJID, session)
 
-	triggerScrapeAndSend(user, session)
+	for {
+		// Randomized Jitter: Base interval + 60 to 120 seconds random sleep
+		jitterSeconds := rand.Intn(61) + 60
+		sleepDuration := session.Frequency + (time.Duration(jitterSeconds) * time.Second)
 
-	for range ticker.C {
+		log.Printf("[Monitor] Next check for %s scheduled in %v (including %ds jitter)", userKey, sleepDuration, jitterSeconds)
+		time.Sleep(sleepDuration)
+
 		sessionMutex.Lock()
-		currentSession, exists := sessionStore[user]
+		currentSession, exists := sessionStore[userKey]
 		if !exists || currentSession.CurrentState != StateMonitoring {
 			sessionMutex.Unlock()
-			log.Printf("[-] Stopping monitor routine loop for user %s.", user)
+			log.Printf("[-] Stopping monitor routine for user %s.", userKey)
 			return
 		}
 		sessionMutex.Unlock()
 
-		triggerScrapeAndSend(user, session)
+		triggerScrapeAndSend(targetJID, session)
 	}
 }
 
-func triggerScrapeAndSend(user string, session *UserSession) {
+func triggerScrapeAndSend(targetJID types.JID, session *UserSession) {
 	log.Printf("[Scraper] Running Chromedp engine cycle for: %s | %s", session.Theater, session.Time)
 
 	matrixStr := fetchCanvasMatrix(session.TargetURL)
 
-	// Safe Unicode (Rune) Truncation to prevent invalid UTF-8 byte corruption
 	runes := []rune(matrixStr)
-	if len(runes) > 500 {
-		matrixStr = string(runes[:500]) + "\n...[truncated]"
+	if len(runes) > 1200 {
+		matrixStr = string(runes[:1200]) + "\n...[truncated]"
 	}
 
 	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
 		session.Movie, session.Theater, session.Time, matrixStr)
 
-	sendTwilioWhatsAppMessage(user, formattedMsg)
+	// Human-like typing presence before sending
+	_ = waClient.SendChatPresence(targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	time.Sleep(time.Duration(rand.Intn(3)+3) * time.Second)
+	_ = waClient.SendChatPresence(targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
+
+	sendWhatsAppMessage(targetJID, formattedMsg)
+}
+
+func sendWhatsAppMessage(targetJID types.JID, messageText string) {
+	msg := &waE2E.Message{
+		Conversation: proto.String(messageText),
+	}
+	_, err := waClient.SendMessage(context.Background(), targetJID, msg)
+	if err != nil {
+		log.Printf("[-] Failed to deliver WhatsApp message to %s: %v", targetJID.String(), err)
+		return
+	}
+	log.Printf("[+] Delivered WhatsApp message to %s", targetJID.String())
 }
 
 func fetchCanvasMatrix(targetURL string) string {
 	ctx, cancelTimeout := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancelTimeout()
 
-	// Connect context with Docker-compatible Chromium flags
 	taskCtx, cancelChrome := createChromeContext(ctx)
 	defer cancelChrome()
 
@@ -204,7 +282,6 @@ func fetchCanvasMatrix(targetURL string) string {
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(targetURL),
 		chromedp.Sleep(7*time.Second),
-
 		chromedp.Evaluate(`(() => {
 			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
 				return "ERROR: Canvas stage not initialized yet.";
@@ -291,48 +368,6 @@ func fetchCanvasMatrix(targetURL string) string {
 	return finalMatrix
 }
 
-func sendTwilioWhatsAppMessage(toUser string, messageText string) {
-	if TwilioAccountSID == "YOUR_TWILIO_ACCOUNT_SID" {
-		log.Println("[Warning] Twilio credentials not configured. Outputting to console instead.")
-		log.Printf("[OUTBOUND TO %s]:\n%s", toUser, messageText)
-		return
-	}
-
-	// Clean up leading/trailing spaces
-	formattedTo := strings.TrimSpace(toUser)
-	formattedFrom := strings.TrimSpace(TwilioFromNumber)
-
-	// Strictly ensure 'whatsapp:' prefix is attached
-	if !strings.HasPrefix(formattedTo, "whatsapp:") {
-		formattedTo = "whatsapp:" + formattedTo
-	}
-	if !strings.HasPrefix(formattedFrom, "whatsapp:") {
-		formattedFrom = "whatsapp:" + formattedFrom
-	}
-
-	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", TwilioAccountSID)
-
-	data := url.Values{}
-	data.Set("From", formattedFrom)
-	data.Set("To", formattedTo)
-	data.Set("Body", messageText)
-
-	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
-	req.SetBasicAuth(TwilioAccountSID, TwilioAuthToken)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[-] Failed to deliver Twilio payload: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("[+] Twilio Response (Status %s): %s", resp.Status, string(respBody))
-}
-
 func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
 	execPath := os.Getenv("CHROME_PATH")
 	if execPath == "" {
@@ -360,11 +395,4 @@ func createChromeContext(parentCtx context.Context) (context.Context, context.Ca
 	}
 
 	return taskCtx, cancel
-}
-
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
 }
