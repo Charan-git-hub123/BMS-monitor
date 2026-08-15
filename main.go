@@ -82,12 +82,11 @@ func main() {
 	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
 
-	// Dispatch each WhatsApp event in its own goroutine to avoid blocking the network socket
 	waClient.AddEventHandler(func(evt interface{}) {
 		go handleWhatsAppEvent(evt)
 	})
 
-	// 2. Connect or Pair
+	// 2. Connect properly based on whether session exists
 	if waClient.Store.ID == nil {
 		phoneNum := os.Getenv("WHATSAPP_PHONE_NUMBER")
 		reg := regexp.MustCompile("[^0-9]")
@@ -104,7 +103,6 @@ func main() {
 
 		time.Sleep(2 * time.Second)
 
-		// Request 8-digit Pairing Code
 		code, err := waClient.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
 			log.Fatalf("Failed to generate pairing code: %v", err)
@@ -118,6 +116,7 @@ func main() {
 		log.Printf("🔥 YOUR 8-DIGIT PAIRING CODE IS: %s 🔥", code)
 		log.Println("==================================================")
 	} else {
+		// ALREADY PAIRED: Just connect directly without trying to pair again!
 		err = waClient.Connect()
 		if err != nil {
 			log.Fatalf("Failed to reconnect WhatsApp: %v", err)
@@ -125,7 +124,7 @@ func main() {
 		pairingCodeMutex.Lock()
 		currentPairingCode = "✅ Connected & Authenticated"
 		pairingCodeMutex.Unlock()
-		log.Println("WhatsApp client reconnected successfully using Supabase session.")
+		log.Println("[+] WhatsApp client reconnected successfully using Supabase session.")
 	}
 
 	// 3. HTTP Health & Status Server
