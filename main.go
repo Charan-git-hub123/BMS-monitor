@@ -336,10 +336,10 @@ func fetchCanvasMatrix(targetURL string) string {
 
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(targetURL),
-		chromedp.Sleep(10*time.Second),
+		chromedp.Sleep(12*time.Second),
 		chromedp.Evaluate(`(() => {
 			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
-				return "NOTICE: Page loaded, but Konva canvas stage is protected or loading. Retrying next cycle...";
+				return "ERROR: Konva stage object not found on page (Page structure may have changed or blocked).";
 			}
 
 			let stage = window.Konva.stages[0];
@@ -412,12 +412,12 @@ func fetchCanvasMatrix(targetURL string) string {
 				rowLabelChar++;
 			});
 
-			return output || "NOTICE: Canvas grid elements not exposed yet.";
+			return output || "ERROR: Canvas rect elements matched zero seats.";
 		})()`, &finalMatrix),
 	)
 
 	if err != nil {
-		return "⚠️ BMS Anti-bot Protection Active: Unable to parse canvas directly from cloud container. Target showtime is monitored."
+		return fmt.Sprintf("Scraper Real Error: %v", err)
 	}
 
 	return finalMatrix
