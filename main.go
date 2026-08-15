@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -52,12 +52,16 @@ type UserSession struct {
 }
 
 var (
-	sessionStore = make(map[string]*UserSession)
-	sessionMutex sync.Mutex
-	waClient     *whatsmeow.Client
+	sessionStore       = make(map[string]*UserSession)
+	sessionMutex       sync.Mutex
+	waClient           *whatsmeow.Client
+	currentPairingCode = "Initializing..."
+	pairingCodeMutex   sync.RWMutex
 )
 
 func main() {
+	ctx := context.Background()
+
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL environment variable is required")
@@ -65,8 +69,6 @@ func main() {
 
 	// 1. Initialize Supabase SQL Store for session persistence
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-	ctx := context.Background()
-
 	container, err := sqlstore.New(ctx, "postgres", dbURL, dbLog)
 	if err != nil {
 		log.Fatalf("Failed to connect to Supabase: %v", err)
@@ -81,46 +83,92 @@ func main() {
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
 	waClient.AddEventHandler(handleWhatsAppEvent)
 
-	// 2. Pair with QR Code if not already logged in
+	// 2. Pair with Phone Code or Reconnect
 	if waClient.Store.ID == nil {
-		qrChan, _ := waClient.GetQRChannel(context.Background())
+		phoneNum := os.Getenv("WHATSAPP_PHONE_NUMBER")
+		reg := regexp.MustCompile("[^0-9]")
+		cleanPhone := reg.ReplaceAllString(phoneNum, "")
+
+		if cleanPhone == "" {
+			log.Fatal("WHATSAPP_PHONE_NUMBER environment variable is required (e.g. 917989061601)")
+		}
+
+		qrChan, _ := waClient.GetQRChannel(ctx)
 		err = waClient.Connect()
 		if err != nil {
 			log.Fatalf("Failed to connect to WhatsApp: %v", err)
 		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				log.Println("Scan the QR code below from WhatsApp (Linked Devices):")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else {
-				log.Println("QR Channel Event:", evt.Event)
-			}
+
+		// Wait for the websocket connection to initialize
+		<-qrChan
+		time.Sleep(1 * time.Second)
+
+		// Request 8-digit Pairing Code
+		code, err := waClient.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if err != nil {
+			log.Fatalf("Failed to generate pairing code: %v", err)
 		}
+
+		pairingCodeMutex.Lock()
+		currentPairingCode = code
+		pairingCodeMutex.Unlock()
+
+		log.Println("==================================================")
+		log.Printf("🔥 YOUR 8-DIGIT PAIRING CODE IS: %s 🔥", code)
+		log.Println("Enter this on your phone screen right now!")
+		log.Println("==================================================")
 	} else {
 		err = waClient.Connect()
 		if err != nil {
 			log.Fatalf("Failed to reconnect WhatsApp: %v", err)
 		}
+		pairingCodeMutex.Lock()
+		currentPairingCode = "✅ Connected & Authenticated"
+		pairingCodeMutex.Unlock()
 		log.Println("WhatsApp client reconnected using existing Supabase session.")
 	}
 
-	// 3. Render HTTP Health Check server
+	// 3. HTTP Health & Pairing Display Server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		pairingCodeMutex.RLock()
+		displayCode := currentPairingCode
+		pairingCodeMutex.RUnlock()
+
+		html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BMS Monitor WhatsApp Setup</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; background: #f0f2f5;">
+    <div style="background: white; max-width: 480px; margin: 0 auto; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+        <h2 style="color: #128C7E; margin-top: 0;">🎬 BMS Monitor WhatsApp</h2>
+        <p style="color: #667781;">Use this code to link your phone:</p>
+        <div style="background: #e7fce3; border: 2px dashed #25D366; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <span style="font-size: 36px; font-weight: bold; letter-spacing: 4px; color: #075E54;">%s</span>
+        </div>
+        <p style="font-size: 14px; color: #54656f;">Open WhatsApp &rarr; <b>Linked Devices</b> &rarr; <b>Link with phone number instead</b> &rarr; Enter Code</p>
+    </div>
+</body>
+</html>`, displayCode)
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "BMS Monitor WhatsApp Engine is running.")
+		w.Write([]byte(html))
 	})
+
 	go func() {
-		log.Printf("Health server listening on :%s", port)
+		log.Printf("Server listening on :%s", port)
 		if err := http.ListenAndServe(":"+port, nil); err != nil {
 			log.Printf("HTTP server terminated: %v", err)
 		}
 	}()
 
-	// Graceful shutdown handling
+	// Graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
@@ -131,6 +179,15 @@ func main() {
 
 func handleWhatsAppEvent(evt interface{}) {
 	switch v := evt.(type) {
+	case *events.PairSuccess:
+		log.Printf("[+] Device successfully linked: %s", v.ID.String())
+		pairingCodeMutex.Lock()
+		currentPairingCode = "✅ Paired & Connected!"
+		pairingCodeMutex.Unlock()
+
+	case *events.Connected:
+		log.Println("[+] WhatsApp WebSocket connection active.")
+
 	case *events.Message:
 		if v.Info.IsFromMe {
 			return
@@ -215,11 +272,10 @@ func processState(userJID string, session *UserSession, input string) string {
 func startBackgroundMonitor(targetJID types.JID, userKey string, session *UserSession) {
 	log.Printf("[+] Starting background tracker loop for user %s with base frequency %v", userKey, session.Frequency)
 
-	// Immediate first run
+	// Immediate first scrape
 	triggerScrapeAndSend(targetJID, session)
 
 	for {
-		// Randomized Jitter: Base interval + 60 to 120 seconds random sleep
 		jitterSeconds := rand.Intn(61) + 60
 		sleepDuration := session.Frequency + (time.Duration(jitterSeconds) * time.Second)
 
@@ -252,10 +308,11 @@ func triggerScrapeAndSend(targetJID types.JID, session *UserSession) {
 	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
 		session.Movie, session.Theater, session.Time, matrixStr)
 
-	// Human-like typing presence before sending
+	// Typing presence simulator
 	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 	time.Sleep(time.Duration(rand.Intn(3)+3) * time.Second)
 	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
+
 	sendWhatsAppMessage(targetJID, formattedMsg)
 }
 
