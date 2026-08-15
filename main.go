@@ -65,12 +65,14 @@ func main() {
 
 	// 1. Initialize Supabase SQL Store for session persistence
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-	container, err := sqlstore.New("postgres", dbURL, dbLog)
+	ctx := context.Background()
+
+	container, err := sqlstore.New(ctx, "postgres", dbURL, dbLog)
 	if err != nil {
 		log.Fatalf("Failed to connect to Supabase: %v", err)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		log.Fatalf("Failed to fetch device store: %v", err)
 	}
