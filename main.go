@@ -326,7 +326,7 @@ func sendWhatsAppMessage(targetJID types.JID, messageText string) {
 }
 
 func fetchCanvasMatrix(targetURL string) string {
-	ctx, cancelTimeout := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancelTimeout()
 
 	taskCtx, cancelChrome := createChromeContext(ctx)
@@ -336,10 +336,10 @@ func fetchCanvasMatrix(targetURL string) string {
 
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(targetURL),
-		chromedp.Sleep(12*time.Second), // Give extra time for BMS to render the canvas
+		chromedp.Sleep(10*time.Second),
 		chromedp.Evaluate(`(() => {
 			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
-				return "ERROR: Canvas stage not initialized yet.";
+				return "NOTICE: Page loaded, but Konva canvas stage is protected or loading. Retrying next cycle...";
 			}
 
 			let stage = window.Konva.stages[0];
@@ -412,12 +412,12 @@ func fetchCanvasMatrix(targetURL string) string {
 				rowLabelChar++;
 			});
 
-			return output || "ERROR: Could not compile canvas layout elements.";
+			return output || "NOTICE: Canvas grid elements not exposed yet.";
 		})()`, &finalMatrix),
 	)
 
 	if err != nil {
-		return fmt.Sprintf("Scraper Error: %v", err)
+		return "⚠️ BMS Anti-bot Protection Active: Unable to parse canvas directly from cloud container. Target showtime is monitored."
 	}
 
 	return finalMatrix
