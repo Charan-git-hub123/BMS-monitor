@@ -251,10 +251,9 @@ func triggerScrapeAndSend(targetJID types.JID, session *UserSession) {
 		session.Movie, session.Theater, session.Time, matrixStr)
 
 	// Human-like typing presence before sending
-	_ = waClient.SendChatPresence(targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 	time.Sleep(time.Duration(rand.Intn(3)+3) * time.Second)
-	_ = waClient.SendChatPresence(targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
-
+	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
 	sendWhatsAppMessage(targetJID, formattedMsg)
 }
 
