@@ -326,7 +326,7 @@ func sendWhatsAppMessage(targetJID types.JID, messageText string) {
 }
 
 func fetchCanvasMatrix(targetURL string) string {
-	ctx, cancelTimeout := context.WithTimeout(context.Background(), 35*time.Second)
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelTimeout()
 
 	taskCtx, cancelChrome := createChromeContext(ctx)
@@ -336,7 +336,7 @@ func fetchCanvasMatrix(targetURL string) string {
 
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate(targetURL),
-		chromedp.Sleep(7*time.Second),
+		chromedp.Sleep(12*time.Second), // Give extra time for BMS to render the canvas
 		chromedp.Evaluate(`(() => {
 			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
 				return "ERROR: Canvas stage not initialized yet.";
@@ -439,6 +439,7 @@ func createChromeContext(parentCtx context.Context) (context.Context, context.Ca
 		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("single-process", true),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"), // Hides bot signature from BMS
 	)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parentCtx, opts...)
