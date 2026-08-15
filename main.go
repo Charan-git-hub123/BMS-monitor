@@ -81,9 +81,13 @@ func main() {
 
 	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
-	waClient.AddEventHandler(handleWhatsAppEvent)
 
-	// 2. Pair with Phone Code or Reconnect
+	// Dispatch each WhatsApp event in its own goroutine to avoid blocking the network socket
+	waClient.AddEventHandler(func(evt interface{}) {
+		go handleWhatsAppEvent(evt)
+	})
+
+	// 2. Connect or Pair
 	if waClient.Store.ID == nil {
 		phoneNum := os.Getenv("WHATSAPP_PHONE_NUMBER")
 		reg := regexp.MustCompile("[^0-9]")
@@ -93,15 +97,12 @@ func main() {
 			log.Fatal("WHATSAPP_PHONE_NUMBER environment variable is required (e.g. 917989061601)")
 		}
 
-		qrChan, _ := waClient.GetQRChannel(ctx)
 		err = waClient.Connect()
 		if err != nil {
 			log.Fatalf("Failed to connect to WhatsApp: %v", err)
 		}
 
-		// Wait for the websocket connection to initialize
-		<-qrChan
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 
 		// Request 8-digit Pairing Code
 		code, err := waClient.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
@@ -115,7 +116,6 @@ func main() {
 
 		log.Println("==================================================")
 		log.Printf("🔥 YOUR 8-DIGIT PAIRING CODE IS: %s 🔥", code)
-		log.Println("Enter this on your phone screen right now!")
 		log.Println("==================================================")
 	} else {
 		err = waClient.Connect()
@@ -125,10 +125,10 @@ func main() {
 		pairingCodeMutex.Lock()
 		currentPairingCode = "✅ Connected & Authenticated"
 		pairingCodeMutex.Unlock()
-		log.Println("WhatsApp client reconnected using existing Supabase session.")
+		log.Println("WhatsApp client reconnected successfully using Supabase session.")
 	}
 
-	// 3. HTTP Health & Pairing Display Server
+	// 3. HTTP Health & Status Server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -140,18 +140,11 @@ func main() {
 
 		html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
-<head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>BMS Monitor WhatsApp Setup</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 40px 20px; background: #f0f2f5;">
-    <div style="background: white; max-width: 480px; margin: 0 auto; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-        <h2 style="color: #128C7E; margin-top: 0;">🎬 BMS Monitor WhatsApp</h2>
-        <p style="color: #667781;">Use this code to link your phone:</p>
-        <div style="background: #e7fce3; border: 2px dashed #25D366; padding: 15px; border-radius: 8px; margin: 20px 0;">
-            <span style="font-size: 36px; font-weight: bold; letter-spacing: 4px; color: #075E54;">%s</span>
-        </div>
-        <p style="font-size: 14px; color: #54656f;">Open WhatsApp &rarr; <b>Linked Devices</b> &rarr; <b>Link with phone number instead</b> &rarr; Enter Code</p>
+<head><meta name="viewport" content="width=device-width, initial-scale=1"><title>BMS Monitor WhatsApp</title></head>
+<body style="font-family: sans-serif; text-align: center; padding: 40px; background: #f0f2f5;">
+    <div style="background: white; max-width: 450px; margin: auto; padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+        <h2 style="color: #128C7E;">🎬 BMS Monitor Status</h2>
+        <div style="background: #e7fce3; padding: 15px; border-radius: 8px; font-size: 24px; font-weight: bold; color: #075E54;">%s</div>
     </div>
 </body>
 </html>`, displayCode)
