@@ -4,21 +4,25 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
+	"net/http"
 	"os"
+	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/chromedp/chromedp"
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
-	"google.golang.org/protobuf/proto"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 type ChatState string
@@ -27,174 +31,356 @@ const (
 	StateStart             ChatState = "START"
 	StateAwaitingCity      ChatState = "AWAITING_CITY"
 	StateAwaitingMovie     ChatState = "AWAITING_MOVIE"
-	StateAwaitingEventCode ChatState = "AWAITING_EVENT_CODE"
+	StateAwaitingLanguage  ChatState = "AWAITING_LANGUAGE"
 	StateAwaitingDate      ChatState = "AWAITING_DATE"
-	StateAwaitingTheater   ChatState = "AWAITING_THEATER"
-	StateAwaitingShowID    ChatState = "AWAITING_SHOW_ID"
+	StateAwaitingShow      ChatState = "AWAITING_SHOW"
 	StateAwaitingFrequency ChatState = "AWAITING_FREQUENCY"
 	StateMonitoring        ChatState = "MONITORING"
 )
 
+// minFrequency throttles how often we hit BookMyShow. Polling harder than this
+// is both rude and a good way to get the number or the IP blocked.
+const minFrequency = 5 * time.Minute
+
+// maxScrapeFailures stops a monitor that keeps failing, rather than messaging
+// the same error every cycle forever.
+const maxScrapeFailures = 5
+
 type UserSession struct {
-	CurrentState  ChatState
-	City          string
-	Movie         string
-	EventCode     string
-	Date          string
-	Theater       string
-	ShowID        string
-	Frequency     time.Duration
-	TargetURL     string
+	CurrentState ChatState
+
+	City     string
+	Movie    string
+	MovieURL string
+	BookURL  string
+	Date     string
+	Venue    string
+	ShowTime string
+	SeatURL  string
+
+	Frequency time.Duration
+
+	Movies    []choice
+	Languages []choice
+	Shows     []choice
+
 	CancelMonitor context.CancelFunc
+	busy          bool
 }
 
 var (
-	client       *whatsmeow.Client
 	sessionStore = make(map[string]*UserSession)
 	sessionMutex sync.Mutex
+	waClient     *whatsmeow.Client
+
+	connState   = "starting"
+	connStateMu sync.RWMutex
 )
 
+func setConnState(s string) {
+	connStateMu.Lock()
+	connState = s
+	connStateMu.Unlock()
+}
+
+func getConnState() string {
+	connStateMu.RLock()
+	defer connStateMu.RUnlock()
+	return connState
+}
+
 func main() {
-	// ==========================================
-	// CONFIG FOR LOCAL TESTING
-	// ==========================================
-	dbURL := "postgresql://postgres.lbcryawiflxbygamfdbn:Icelovesme@278727@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres"
-
-
-	cleanPhone := "917989061601"
-
 	ctx := context.Background()
-	dbLog := waLog.Stdout("Database", "Error", true)
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	phoneNum := os.Getenv("WHATSAPP_PHONE_NUMBER")
+	cleanPhone := regexp.MustCompile("[^0-9]").ReplaceAllString(phoneNum, "")
+
+	if dryRunMode {
+		log.Println("[!] DRY_RUN=1 - outbound messages will be logged, not sent")
+	}
+
+	dbLog := waLog.Stdout("Database", "ERROR", true)
 	container, err := sqlstore.New(ctx, "postgres", dbURL, dbLog)
 	if err != nil {
-		log.Fatalf("Failed to connect to Supabase: %v", err)
+		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
 
 	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
-		log.Fatalf("Failed to get device store: %v", err)
+		log.Fatalf("Failed to fetch device store: %v", err)
 	}
 
-	clientLog := waLog.Stdout("Client", "Info", true)
-	client = whatsmeow.NewClient(deviceStore, clientLog)
-	client.AddEventHandler(handleWhatsAppEvent)
+	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
+	waClient = whatsmeow.NewClient(deviceStore, clientLog)
 
-	if client.Store.ID == nil {
-		err = client.Connect()
-		if err != nil {
-			log.Fatalf("Failed to connect: %v", err)
-		}
+	// Each event on its own goroutine: a scrape takes ~15s and must not block
+	// whatsmeow's event loop.
+	waClient.AddEventHandler(func(evt interface{}) {
+		go handleWhatsAppEvent(evt)
+	})
 
-		pairingCode, err := client.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Windows)")
-		if err != nil {
-			log.Fatalf("Failed to get pairing code: %v", err)
+	if waClient.Store.ID == nil {
+		if cleanPhone == "" {
+			log.Fatal("WHATSAPP_PHONE_NUMBER is required for first-time pairing")
 		}
-		log.Printf("[+] WhatsApp Pairing Code: %s", pairingCode)
+		if err := waClient.Connect(); err != nil {
+			log.Fatalf("Failed to connect to WhatsApp: %v", err)
+		}
+		time.Sleep(2 * time.Second)
+
+		code, err := waClient.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if err != nil {
+			log.Fatalf("Failed to generate pairing code: %v", err)
+		}
+		setConnState("waiting pairing")
+		// Logs only. This deliberately never reaches the HTTP status page:
+		// that page is public on Render, and anyone holding this code during
+		// the pairing window could link their own device to the account.
+		log.Printf("[+] Pairing code (enter on your phone): %s", code)
 	} else {
-		err = client.Connect()
-		if err != nil {
-			log.Fatalf("Failed to connect: %v", err)
+		if err := waClient.Connect(); err != nil {
+			log.Fatalf("Failed to reconnect WhatsApp: %v", err)
 		}
-		log.Println("[+] WhatsApp client reconnected successfully.")
+		setConnState("connected")
+		log.Println("[+] WhatsApp client reconnected from stored session.")
 	}
+	refreshOwnerIdentities()
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("Server listening on :%s", port)
-	select {}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "BMS Monitor\nstatus: %s\n", getConnState())
+	})
+	go func() {
+		log.Printf("Status server listening on :%s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("HTTP server terminated: %v", err)
+		}
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+	log.Println("Shutting down gracefully...")
+	waClient.Disconnect()
+}
+
+// refreshOwnerIdentities reads the linked device's own identity from the
+// store. Called after pairing and on every reconnect.
+func refreshOwnerIdentities() {
+	if waClient == nil || waClient.Store == nil {
+		return
+	}
+	var ids []types.JID
+	if waClient.Store.ID != nil {
+		ids = append(ids, *waClient.Store.ID)
+	}
+	if waClient.Store.LID.User != "" {
+		ids = append(ids, waClient.Store.LID)
+	}
+	setOwnerIdentities(ids...)
+	log.Printf("[gate] owner identities: %v (bot will only talk to these)", ids)
 }
 
 func handleWhatsAppEvent(evt interface{}) {
 	switch v := evt.(type) {
+	case *events.PairSuccess:
+		log.Printf("[+] Device linked: %s", v.ID.String())
+		setConnState("connected")
+		refreshOwnerIdentities()
+
 	case *events.Connected:
-		log.Println("[+] WhatsApp WebSocket connection active.")
+		log.Println("[+] WhatsApp connection active.")
+		setConnState("connected")
+		refreshOwnerIdentities()
+
+	case *events.Disconnected:
+		setConnState("disconnected")
+
+	case *events.LoggedOut:
+		// Unlinked from the phone. Exit rather than idle in a half-alive state
+		// that would spring back on the next pairing.
+		log.Printf("[!] Device logged out (reason: %v). Exiting.", v.Reason)
+		os.Exit(0)
 
 	case *events.Message:
-		sender := v.Info.Sender.String()
+		// SAFETY GATE -- must stay the first thing in this case. Only the
+		// owner's own self-chat may drive the bot; see guard.go.
+		if ok, reason := allowInbound(v.Info, ownerIdentities(), startedAt); !ok {
+			log.Printf("[gate] ignored message from %s in chat %s: %s",
+				v.Info.Sender.ToNonAD(), v.Info.Chat.ToNonAD(), reason)
+			return
+		}
+
 		text := v.Message.GetConversation()
 		if text == "" && v.Message.GetExtendedTextMessage() != nil {
 			text = v.Message.GetExtendedTextMessage().GetText()
 		}
-		
-		userJID := v.Info.Sender.ToNonAD().String()
 		msgText := strings.TrimSpace(text)
 		if msgText == "" {
 			return
 		}
+		log.Printf("[msg] %q from owner", msgText)
 
-		log.Printf("[INCOMING MESSAGE] From: %s | Text: '%s'", sender, msgText)
+		target := v.Info.Sender.ToNonAD()
+		key := target.String()
+		lower := strings.ToLower(msgText)
 
 		sessionMutex.Lock()
-		session, exists := sessionStore[userJID]
-		if !exists || strings.ToLower(msgText) == "restart" {
+		session, exists := sessionStore[key]
+		if !exists || lower == "hi" || lower == "restart" {
+			if exists && session.CancelMonitor != nil {
+				session.CancelMonitor()
+			}
 			session = &UserSession{CurrentState: StateStart}
-			sessionStore[userJID] = session
+			sessionStore[key] = session
 		}
+		if session.busy {
+			sessionMutex.Unlock()
+			sendWhatsAppMessage(target, "⏳ Still working on the previous step -- one moment.")
+			return
+		}
+		session.busy = true
 		sessionMutex.Unlock()
 
-		reply := processState(userJID, session, msgText, v.Info.Sender)
-		if reply != "" {
-			sendWhatsAppMessage(v.Info.Sender.ToNonAD(), reply)
-		}
+		defer func() {
+			sessionMutex.Lock()
+			session.busy = false
+			sessionMutex.Unlock()
+		}()
+
+		processMessage(target, session, msgText)
 	}
 }
 
-func processState(userJID string, session *UserSession, input string, sender types.JID) string {
+// processMessage advances the conversation. Unlike the earlier design it sends
+// its own messages rather than returning one string, because the scraping steps
+// take ten to twenty seconds and the user needs an acknowledgement first.
+func processMessage(target types.JID, session *UserSession, input string) {
 	switch session.CurrentState {
 	case StateStart:
 		session.CurrentState = StateAwaitingCity
-		return "🎬 *Welcome to BMS Seat Monitor Bot!*\n\nLet's set up your tracker.\n\nReply with your City (e.g., Hyderabad, Bangalore, Vizag):"
+		sendWhatsAppMessage(target, "🍿 *BMS Seat Monitor*\n\nWhich city? (e.g. Hyderabad, Mumbai, Bengaluru)")
 
 	case StateAwaitingCity:
 		session.City = input
+		sendWhatsAppMessage(target, fmt.Sprintf("🔍 %s -- fetching what's playing, this takes a few seconds...", input))
+
+		movies, err := fetchCityMovies(input)
+		if err != nil {
+			sendWhatsAppMessage(target, fmt.Sprintf("❌ Couldn't list movies for %s.\n\n%v\n\nSend a different city, or *restart*.", input, err))
+			return
+		}
+		session.Movies = movies
 		session.CurrentState = StateAwaitingMovie
-		return fmt.Sprintf("City set to: *%s* 📍\n\nNow enter the Movie Name you want to watch (e.g., DC):", session.City)
+		sendWhatsAppMessage(target, renderChoices("🎬 *Now showing -- reply with a number:*", movies))
 
 	case StateAwaitingMovie:
-		session.Movie = input
-		session.CurrentState = StateAwaitingEventCode
-		return fmt.Sprintf("Movie: *%s* 🎥\n\nEnter the BookMyShow Movie Event Code (e.g., ET00511463):", session.Movie)
+		pickedMovie, ok := pickChoice(session.Movies, input)
+		if !ok {
+			sendWhatsAppMessage(target, "Please reply with one of the numbers above, or *restart*.")
+			return
+		}
+		session.Movie = pickedMovie.Label
+		session.MovieURL = pickedMovie.URL
+		sendWhatsAppMessage(target, fmt.Sprintf("🎟️ %s -- checking languages and formats...", pickedMovie.Label))
 
-	case StateAwaitingEventCode:
-		session.EventCode = input
+		opts, err := fetchBookingOptions(pickedMovie.URL)
+		if err != nil {
+			sendWhatsAppMessage(target, fmt.Sprintf("❌ Couldn't open booking for %s.\n\n%v\n\nSend *restart* to try again.", pickedMovie.Label, err))
+			return
+		}
+		if len(opts) == 1 {
+			session.BookURL = opts[0].URL
+			session.CurrentState = StateAwaitingDate
+			sendWhatsAppMessage(target, "Which date? Reply *today*, *tomorrow*, or *YYYYMMDD* (e.g. 20260901):")
+			return
+		}
+		session.Languages = opts
+		session.CurrentState = StateAwaitingLanguage
+		sendWhatsAppMessage(target, renderChoices("🗣️ *Language / format -- reply with a number:*", opts))
+
+	case StateAwaitingLanguage:
+		pickedLang, ok := pickChoice(session.Languages, input)
+		if !ok {
+			sendWhatsAppMessage(target, "Please reply with one of the numbers above, or *restart*.")
+			return
+		}
+		session.BookURL = pickedLang.URL
 		session.CurrentState = StateAwaitingDate
-		return "Enter the Date in YYYYMMDD format (e.g., 20260816):"
+		sendWhatsAppMessage(target, "Which date? Reply *today*, *tomorrow*, or *YYYYMMDD* (e.g. 20260901):")
 
 	case StateAwaitingDate:
-		session.Date = input
-		session.CurrentState = StateAwaitingTheater
-		return "Enter your Theater Code (e.g., AMBH):"
+		date, ok := parseDate(input)
+		if !ok {
+			sendWhatsAppMessage(target, "Date must be *today*, *tomorrow*, or *YYYYMMDD* (e.g. 20260901).")
+			return
+		}
+		session.Date = date
+		sendWhatsAppMessage(target, fmt.Sprintf("📅 %s -- fetching theatres and showtimes...", date))
 
-	case StateAwaitingTheater:
-		session.Theater = input
-		session.CurrentState = StateAwaitingShowID
-		return "Enter the specific Show/Venue ID (e.g., 116579):"
+		shows, err := fetchTheatersAndShowtimes(session.BookURL, date)
+		if err != nil {
+			sendWhatsAppMessage(target, fmt.Sprintf("❌ Couldn't list showtimes.\n\n%v\n\nTry another date, or *restart*.", err))
+			return
+		}
+		session.Shows = shows
+		session.CurrentState = StateAwaitingShow
+		sendWhatsAppMessage(target, renderChoices("🎭 *Theatre & showtime -- reply with a number:*", shows))
 
-	case StateAwaitingShowID:
-		session.ShowID = input
+	case StateAwaitingShow:
+		pickedShow, ok := pickChoice(session.Shows, input)
+		if !ok {
+			sendWhatsAppMessage(target, "Please reply with one of the numbers above, or *restart*.")
+			return
+		}
+		session.Venue = pickedShow.Venue
+		session.ShowTime = pickedShow.Time
+		sendWhatsAppMessage(target, fmt.Sprintf("🎟️ %s -- opening the seat layout...", pickedShow.Label))
+
+		seatURL := pickedShow.URL
+		if seatURL == "" || !strings.Contains(seatURL, "seat-layout") {
+			resolved, err := resolveSeatLayoutURL(session.BookURL, session.Date, pickedShow.Venue, pickedShow.Time)
+			if err != nil {
+				sendWhatsAppMessage(target, fmt.Sprintf("❌ Couldn't reach the seat layout.\n\n%v\n\nPick another show, or *restart*.", err))
+				return
+			}
+			seatURL = resolved
+		}
+		session.SeatURL = seatURL
 		session.CurrentState = StateAwaitingFrequency
-		
-		session.TargetURL = fmt.Sprintf("https://in.bookmyshow.com/movies/hyd/seat-layout/%s/%s/%s/%s", 
-			session.EventCode, session.Theater, session.ShowID, session.Date)
-
-		return "Final step: How often do you want updates?\n\nReply with a number in minutes (e.g., type 5, 15, or 30):"
+		sendWhatsAppMessage(target, fmt.Sprintf("🔒 Locked on.\n\nHow often should I check? Reply with minutes (minimum %d):", int(minFrequency.Minutes())))
 
 	case StateAwaitingFrequency:
-		var mins int
-		_, err := fmt.Sscanf(input, "%d", &mins)
+		mins, err := strconv.Atoi(strings.TrimSpace(input))
 		if err != nil || mins <= 0 {
-			mins = 10
+			sendWhatsAppMessage(target, fmt.Sprintf("Reply with a positive number of minutes (minimum %d).", int(minFrequency.Minutes())))
+			return
 		}
-		session.Frequency = time.Duration(mins) * time.Minute
+		freq := time.Duration(mins) * time.Minute
+		if freq < minFrequency {
+			freq = minFrequency
+			sendWhatsAppMessage(target, fmt.Sprintf("ℹ️ Raised to the %d minute minimum to avoid being blocked by BookMyShow.", int(minFrequency.Minutes())))
+		}
+		session.Frequency = freq
 		session.CurrentState = StateMonitoring
 
-		ctx, cancel := context.WithCancel(context.Background())
+		monCtx, cancel := context.WithCancel(context.Background())
 		session.CancelMonitor = cancel
-		go startMonitoring(sender, session, ctx)
+		go startBackgroundMonitor(monCtx, target, session)
 
-		return fmt.Sprintf("🚀 *Monitoring Active!*\n\nTarget URL: %s\nChecking every %d minutes. Type *restart* anytime to reset.", session.TargetURL, mins)
+		sendWhatsAppMessage(target, fmt.Sprintf(
+			"🚀 *Monitoring started*\n\n%s\n%s | %s\n📅 %s\n⏱️ every %v\n\nSend *stop* to end, *restart* to reconfigure.",
+			session.Movie, session.Venue, session.ShowTime, session.Date, freq))
 
 	case StateMonitoring:
 		if strings.ToLower(input) == "stop" {
@@ -202,181 +388,148 @@ func processState(userJID string, session *UserSession, input string, sender typ
 				session.CancelMonitor()
 			}
 			session.CurrentState = StateStart
-			return "⏹️ Monitoring stopped. Send *restart* to begin again."
+			sendWhatsAppMessage(target, "⏹️ Stopped. Send *hi* to set up a new tracker.")
+			return
 		}
-		return "Bot is currently monitoring seats. Type *stop* or *restart*."
+		sendWhatsAppMessage(target, fmt.Sprintf("Currently watching %s at %s (%s). Send *stop* or *restart*.",
+			session.Movie, session.Venue, session.ShowTime))
 	}
-
-	return "Send *restart* to begin tracking."
 }
 
-func startMonitoring(targetJID types.JID, session *UserSession, ctx context.Context) {
-	ticker := time.NewTicker(session.Frequency)
-	defer ticker.Stop()
-
-	runScraperAndNotify(targetJID, session)
-
+func startBackgroundMonitor(ctx context.Context, target types.JID, session *UserSession) {
+	log.Printf("[monitor] started: %s | %s | %s | every %v", session.Movie, session.Venue, session.ShowTime, session.Frequency)
+	failures := 0
 	for {
+		matrix, err := fetchCanvasMatrix(session.SeatURL)
+		if err != nil {
+			failures++
+			log.Printf("[monitor] scrape failed (%d/%d): %v", failures, maxScrapeFailures, err)
+			sendWhatsAppMessage(target, fmt.Sprintf("⚠️ Check failed (%d/%d): %v", failures, maxScrapeFailures, err))
+			if failures >= maxScrapeFailures {
+				sendWhatsAppMessage(target, "🛑 Too many consecutive failures -- monitoring stopped. Send *restart* to set it up again.")
+				sessionMutex.Lock()
+				session.CurrentState = StateStart
+				sessionMutex.Unlock()
+				return
+			}
+		} else {
+			failures = 0
+			body := matrix
+			if runes := []rune(body); len(runes) > 1200 {
+				body = string(runes[:1200]) + "\n...[truncated]"
+			}
+			sendWhatsAppMessage(target, fmt.Sprintf("🎟️ *%s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
+				session.Movie, session.Venue, session.ShowTime, body))
+		}
+
+		// Jitter so the polling pattern is not perfectly periodic.
+		sleep := session.Frequency + time.Duration(rand.Intn(61)+60)*time.Second
+		log.Printf("[monitor] next check in %v", sleep)
 		select {
 		case <-ctx.Done():
+			log.Printf("[monitor] cancelled: %s", session.Movie)
 			return
-		case <-ticker.C:
-			runScraperAndNotify(targetJID, session)
+		case <-time.After(sleep):
 		}
 	}
 }
 
-func runScraperAndNotify(targetJID types.JID, session *UserSession) {
-	log.Printf("[Scraper] Running Chromedp engine for URL: %s", session.TargetURL)
-	matrix := fetchCanvasMatrix(session.TargetURL)
-
-	msg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 Theater: %s\n\n```\n%s\n```", session.Movie, session.Theater, matrix)
-	sendWhatsAppMessage(targetJID, msg)
-}
-
-func fetchCanvasMatrix(targetURL string) string {
-	ctx, cancelTimeout := context.WithTimeout(context.Background(), 50*time.Second)
-	defer cancelTimeout()
-
-	taskCtx, cancelChrome := createChromeContext(ctx)
-	defer cancelChrome()
-
-	var finalMatrix string
-
-	err := chromedp.Run(taskCtx,
-		chromedp.Navigate(targetURL),
-		chromedp.Sleep(12*time.Second),
-		chromedp.Evaluate(`(() => {
-			if (!window.Konva || !window.Konva.stages || window.Konva.stages.length === 0) {
-				return "ERROR: Konva stage object not found on page (Page structure may have changed or blocked).";
-			}
-
-			let stage = window.Konva.stages[0];
-			let rows = {};
-			let tiers = [];
-
-			let textNodes = stage.find('Text');
-			textNodes.forEach(t => {
-				let textStr = (t.attrs.text || "").trim();
-				if (textStr && (textStr.includes('₹') || textStr.includes('Rs.') || textStr.length > 8)) {
-					if (!textStr.includes(':') && !textStr.match(/^\d+$/) && !textStr.includes('Pay')) {
-						tiers.push({ y: t.attrs.y, name: textStr.toUpperCase() });
-					}
-				}
-			});
-
-			tiers.sort((a, b) => a.y - b.y);
-
-			let rectShapes = stage.find('Rect');
-			rectShapes.forEach(shape => {
-				let attrs = shape.attrs || {};
-				if (attrs.width === 22 && attrs.height === 22) {
-					let yKey = attrs.y; 
-					let fill = String(attrs.fill || "").toUpperCase();
-					
-					if (!rows[yKey]) rows[yKey] = [];
-
-					if (fill === '#E5E5E5' || fill === 'E5E5E5') {
-						rows[yKey].push({ x: attrs.x, emoji: "🟥" });
-					} else {
-						rows[yKey].push({ x: attrs.x, emoji: "🟩" });
-					}
-				}
-			});
-
-			let sortedY = Object.keys(rows).sort((a, b) => Number(a) - Number(b));
-			let output = "";
-			let currentTierIndex = 0;
-			let rowLabelChar = 65;
-
-			sortedY.forEach(y => {
-				let rowYNum = Number(y);
-
-				while (currentTierIndex < tiers.length && rowYNum > tiers[currentTierIndex].y) {
-					output += "\n✨ --- " + tiers[currentTierIndex].name + " --- ✨\n";
-					currentTierIndex++;
-				}
-
-				let seatRow = rows[y];
-				seatRow.sort((a, b) => a.x - b.x);
-				
-				let rowString = String.fromCharCode(rowLabelChar) + ": ";
-				let prevX = null;
-
-				seatRow.forEach(seat => {
-					if (prevX !== null) {
-						let diff = seat.x - prevX;
-						if (diff > 35) {
-							let emptySlots = Math.max(1, Math.round(diff / 26) - 1);
-							for (let i = 0; i < emptySlots; i++) {
-								rowString += "⬜ "; 
-							}
-						}
-					}
-					rowString += seat.emoji + " ";
-					prevX = seat.x;
-				});
-				
-				output += rowString + "\n";
-				rowLabelChar++;
-			});
-
-			return output || "ERROR: Canvas rect elements matched zero seats.";
-		})()`, &finalMatrix),
-	)
-
-	if err != nil {
-		return fmt.Sprintf("Scraper Real Error: %v", err)
-	}
-
-	return finalMatrix
-}
-
-func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
-	execPath := os.Getenv("CHROME_PATH")
-	if execPath == "" {
-		if _, err := os.Stat(`C:\Program Files\Google\Chrome\Application\chrome.exe`); err == nil {
-			execPath = `C:\Program Files\Google\Chrome\Application\chrome.exe`
-		} else if _, err := os.Stat(`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`); err == nil {
-			execPath = `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`
-		} else {
-			execPath = "/usr/bin/chromium-browser"
-		}
-	}
-
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.ExecPath(execPath),
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Headless,
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-	)
-
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parentCtx, opts...)
-	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
-
-	cancel := func() {
-		cancelTask()
-		cancelAlloc()
-	}
-
-	return taskCtx, cancel
-}
-
-func sendWhatsAppMessage(recipient types.JID, message string) {
-	if client == nil || !client.IsConnected() {
-		log.Println("[-] WhatsApp client not connected, cannot send message.")
+func sendWhatsAppMessage(targetJID types.JID, messageText string) {
+	// SAFETY GATE -- last check before the network. See guard.go.
+	if ok, reason := allowOutbound(targetJID, ownerIdentities()); !ok {
+		log.Printf("[gate] BLOCKED outbound message to %s: %s", targetJID.ToNonAD(), reason)
 		return
 	}
-	
-	_, err := client.SendMessage(context.Background(), recipient, &waE2E.Message{
-		Conversation: proto.String(message),
-	})
-	if err != nil {
-		log.Printf("[-] Failed to send WhatsApp message: %v", err)
+	if dryRunMode {
+		log.Printf("[dry-run] would send to %s:\n%s", targetJID.ToNonAD(), messageText)
+		return
 	}
+	msg := &waE2E.Message{Conversation: proto.String(messageText)}
+	if _, err := waClient.SendMessage(context.Background(), targetJID, msg); err != nil {
+		log.Printf("[-] Failed to deliver message to %s: %v", targetJID.ToNonAD(), err)
+		return
+	}
+	log.Printf("[+] Delivered message to %s", targetJID.ToNonAD())
+}
+
+// renderChoices formats a numbered menu for WhatsApp.
+func renderChoices(header string, list []choice) string {
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n\n")
+	for i, c := range list {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, c.Label)
+	}
+	b.WriteString("\nReply with the number, or *restart* to start over.")
+	return b.String()
+}
+
+// pickChoice resolves a reply to a menu entry: a number, or enough of the
+// label to identify it unambiguously.
+func pickChoice(list []choice, input string) (choice, bool) {
+	if len(list) == 0 {
+		return choice{}, false
+	}
+	trimmed := strings.TrimSpace(input)
+	if n, err := strconv.Atoi(trimmed); err == nil {
+		if n >= 1 && n <= len(list) {
+			return list[n-1], true
+		}
+		return choice{}, false
+	}
+	needle := strings.ToLower(trimmed)
+	if needle == "" {
+		return choice{}, false
+	}
+	var hit choice
+	found := 0
+	for _, c := range list {
+		if strings.Contains(strings.ToLower(c.Label), needle) {
+			hit = c
+			found++
+		}
+	}
+	if found == 1 {
+		return hit, true
+	}
+	return choice{}, false
+}
+
+// parseDate accepts today, tomorrow, or YYYYMMDD, and returns YYYYMMDD.
+func parseDate(input string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(input))
+	switch s {
+	case "today":
+		return time.Now().Format("20060102"), true
+	case "tomorrow":
+		return time.Now().AddDate(0, 0, 1).Format("20060102"), true
+	}
+	if _, err := time.Parse("20060102", s); err == nil {
+		return s, true
+	}
+	return "", false
+}
+
+// citySlug maps a typed city name to the slug BookMyShow uses in its URLs.
+func citySlug(city string) string {
+	s := strings.ToLower(strings.TrimSpace(city))
+	s = strings.Join(strings.Fields(s), "-")
+
+	aliases := map[string]string{
+		"bangalore":  "bengaluru",
+		"bombay":     "mumbai",
+		"madras":     "chennai",
+		"calcutta":   "kolkata",
+		"vizag":      "visakhapatnam",
+		"trivandrum": "thiruvananthapuram",
+		"delhi":      "national-capital-region-ncr",
+		"new-delhi":  "national-capital-region-ncr",
+		"ncr":        "national-capital-region-ncr",
+		"gurgaon":    "national-capital-region-ncr",
+		"noida":      "national-capital-region-ncr",
+	}
+	if alias, ok := aliases[s]; ok {
+		return alias
+	}
+	return s
 }
