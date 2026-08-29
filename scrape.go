@@ -70,7 +70,7 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 
 	// Best effort: drop requests that cannot affect what we extract. Failure
 	// here is not fatal, it just means a slower page.
-	var blocked []string
+	var blocked []network.BlockPattern
 	for _, pattern := range []string{
 		"*://*/*.jpg", "*://*/*.jpeg", "*://*/*.png", "*://*/*.gif",
 		"*://*/*.webp", "*://*/*.ico", "*://*/*.woff", "*://*/*.woff2",
@@ -79,11 +79,11 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 		"*://*.doubleclick.net/*", "*://*.facebook.net/*",
 		"*://*.hotjar.com/*", "*://*.clarity.ms/*", "*://*.branch.io/*",
 	} {
-		blocked = append(blocked, pattern)
+		blocked = append(blocked, network.BlockPattern{URLPattern: pattern, Block: true})
 	}
 	if err := chromedp.Run(runCtx,
 		network.Enable(),
-		network.SetBlockedURLs(blocked),
+		network.SetBlockedURLs().WithURLPatterns(blocked),
 	); err != nil {
 		log.Printf("[scrape] could not install request blocking: %v", err)
 	}
@@ -119,11 +119,7 @@ func checkNotBlocked(ctx context.Context, stage string) error {
 }
 
 // citySlug normalizes city names to BookMyShow's path format.
-func citySlug(city string) string {
-	s := strings.ToLower(strings.TrimSpace(city))
-	s = strings.ReplaceAll(s, " ", "-")
-	return s
-}
+
 
 // movieListJS harvests every anchor carrying a BMS event code (ET######).
 // Keyed on the URL shape rather than CSS classes, as a BMS restyle does not

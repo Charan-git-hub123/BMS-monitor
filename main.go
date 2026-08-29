@@ -105,7 +105,7 @@ func main() {
 		log.Println("[!] DRY_RUN=1 - outbound messages will be logged, not sent")
 	}
 
-	dbLog := waLog.Stdout("Database", envOR("DB_LOG_LEVEL", "WARN"), true)
+	dbLog := waLog.Stdout("Database", envOr("DB_LOG_LEVEL", "WARN"), true)
 	container, err := openStore(ctx,dbURL, dbLog)
 	if err != nil {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
