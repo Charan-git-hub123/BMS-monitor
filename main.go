@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"math/rand"
@@ -104,8 +105,8 @@ func main() {
 		log.Println("[!] DRY_RUN=1 - outbound messages will be logged, not sent")
 	}
 
-	dbLog := waLog.Stdout("Database", "ERROR", true)
-	container, err := sqlstore.New(ctx, "postgres", dbURL, dbLog)
+	dbLog := waLog.Stdout("Database", envOR("DB_LOG_LEVEL", "WARN"), true)
+	container, err := openStore(ctx,dbURL, dbLog)
 	if err != nil {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
@@ -115,7 +116,7 @@ func main() {
 		log.Fatalf("Failed to fetch device store: %v", err)
 	}
 
-	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
+	clientLog := waLog.Stdout("WhatsApp", envOr("WA_LOG_LEVEL", "INFO"), true)
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
 
 	// Each event on its own goroutine: a scrape takes ~15s and must not block
@@ -174,6 +175,53 @@ func main() {
 	waClient.Disconnect()
 }
 
+// openStore opens the Postgres store with explicit pool limits.
+//
+// Every Signal operation whatsmeow performs -- decrypting an incoming message,
+// consuming a prekey, storing a session -- goes through this pool. A pooled
+// connection that has silently died, which Supabase's pooler does to idle
+// connections, therefore surfaces as "Node handling is taking long" repeating
+// for minutes instead of as an error: the query simply never returns. Bounded
+// lifetimes force a reconnect, and connect_timeout stops a dial-hanging.
+func openStore(ctx context.Context, dsn string, dbLog waLog.Logger) (*sqlstore.Container, error) {
+	if !strings.Contains(dsn, "connect_timeout=") {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		dsn += sep + "connect_timeout=10"
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(time.Minute)
+
+	pingCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	container := sqlstore.NewWithDB(db, "postgres", dbLog)
+	if err := container.Upgrade(ctx); err != nil {
+		return nil, fmt.Errorf("upgrade database schema: %w", err)
+	}
+	return container, nil
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+// refreshOwnerIdentities reads the linked device's own identity from the
+// store. Called after pairing and on every reconnect.
 // refreshOwnerIdentities reads the linked device's own identity from the
 // store. Called after pairing and on every reconnect.
 func refreshOwnerIdentities() {
