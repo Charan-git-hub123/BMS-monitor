@@ -70,7 +70,9 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 
 	// Best effort: drop requests that cannot affect what we extract. Failure
 	// here is not fatal, it just means a slower page.
-	var blocked []network.BlockPattern
+	// Best effort: drop requests that cannot affect what we extract. Failure
+// here is not fatal, it just means a slower page.
+	var blocked []*network.BlockPattern
 	for _, pattern := range []string{
 		"*://*/*.jpg", "*://*/*.jpeg", "*://*/*.png", "*://*/*.gif",
 		"*://*/*.webp", "*://*/*.ico", "*://*/*.woff", "*://*/*.woff2",
@@ -79,7 +81,7 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 		"*://*.doubleclick.net/*", "*://*.facebook.net/*",
 		"*://*.hotjar.com/*", "*://*.clarity.ms/*", "*://*.branch.io/*",
 	} {
-		blocked = append(blocked, network.BlockPattern{URLPattern: pattern, Block: true})
+		blocked = append(blocked, &network.BlockPattern{URLPattern: pattern, Block: true})
 	}
 	if err := chromedp.Run(runCtx,
 		network.Enable(),
