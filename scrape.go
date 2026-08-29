@@ -65,12 +65,12 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 	defer cancelAlloc()
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
 	defer cancelBrowser()
-	runCtx, cancelTimeout := chromedp.WithTimeout(browserCtx, timeout)
+	runCtx, cancelTimeout := context.WithTimeout(browserCtx, timeout)
 	defer cancelTimeout()
 
 	// Best effort: drop requests that cannot affect what we extract. Failure
 	// here is not fatal, it just means a slower page.
-	var blocked []network.BlockPattern
+	var blocked []string
 	for _, pattern := range []string{
 		"*://*/*.jpg", "*://*/*.jpeg", "*://*/*.png", "*://*/*.gif",
 		"*://*/*.webp", "*://*/*.ico", "*://*/*.woff", "*://*/*.woff2",
@@ -79,11 +79,11 @@ func withChrome(timeout time.Duration, fn func(ctx context.Context) error) error
 		"*://*.doubleclick.net/*", "*://*.facebook.net/*",
 		"*://*.hotjar.com/*", "*://*.clarity.ms/*", "*://*.branch.io/*",
 	} {
-		blocked = append(blocked, network.BlockPattern{URLPattern: pattern, Block: true})
+		blocked = append(blocked, pattern)
 	}
 	if err := chromedp.Run(runCtx,
 		network.Enable(),
-		network.SetBlockedURLs().WithURLPatterns(blocked),
+		network.SetBlockedURLs(blocked),
 	); err != nil {
 		log.Printf("[scrape] could not install request blocking: %v", err)
 	}
@@ -296,7 +296,6 @@ const showtimesJS = `(() => {
 		if (el.children.length > 0) return; // leaf nodes only
 		let txt = (el.innerText || "").trim();
 		if (!timeRe.test(txt)) return;
-		let clickable = el.closest('a, button, [role="button"], li, div');
 		let href = "";
 		let anchor = el.closest('a[href]');
 		if (anchor) href = anchor.href || "";
