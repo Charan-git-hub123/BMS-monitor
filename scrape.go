@@ -243,7 +243,7 @@ func fetchBookingOptions(movieURL string) ([]choice, error) {
 // nearest ancestor that also holds a cinema link or venue-ish heading.
 const showtimesJS = `(() => {
 	let out = [], seen = {};
-	let timeRe = /^\s*(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?\s*$/;
+	let timeRe = /^\s*(\d{1,2})[:.](\d{2})\s*(AM|PM|am|pm)?\s*$/;
 	let nodes = Array.from(document.querySelectorAll('a, div, span, li, button'));
 
 	function venueFor(el) {
@@ -251,7 +251,7 @@ const showtimesJS = `(() => {
 		for (let i = 0; i < 10 && cur; i++) {
 			cur = cur.parentElement;
 			if (!cur) break;
-			let vlink = cur.querySelector('a[href*="/cinemas"], a[href*="/venue"], [class*="venue"], [class*="Venue"]');
+			let vlink = cur.querySelector('a[href*="/cinemas"], a[href*="/venue"], [class*="venue" i]');
 			if (vlink) {
 				let t = (vlink.innerText || vlink.getAttribute('aria-label') || "").trim().split("\n")[0].trim();
 				if (t && t.length > 2 && !timeRe.test(t)) return t;
@@ -381,7 +381,7 @@ func resolveSeatLayoutURL(bookURL, date, venue, showTime string) (string, error)
 			var accepted bool
 			_ = chromedp.Run(ctx, chromedp.Evaluate(`(() => {
 				let els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-				let hit = els.find(e => /accept|continue|proceed|agree|ok/i.test((e.innerText || "").trim()));
+				let hit = els.find(e => /^(accept|continue|proceed|agree|ok|okay)$/i.test((e.innerText || "").trim()))
 				if (!hit) return false;
 				hit.click();
 				return true;
