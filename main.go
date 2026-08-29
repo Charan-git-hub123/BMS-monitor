@@ -4,27 +4,21 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
-	"net/http"
 	"os"
-	"os/signal"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/chromedp/chromedp"
 	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/protobuf/proto"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/chromedp/chromedp"
 )
 
 type ChatState string
@@ -33,42 +27,44 @@ const (
 	StateStart             ChatState = "START"
 	StateAwaitingCity      ChatState = "AWAITING_CITY"
 	StateAwaitingMovie     ChatState = "AWAITING_MOVIE"
+	StateAwaitingEventCode ChatState = "AWAITING_EVENT_CODE"
 	StateAwaitingDate      ChatState = "AWAITING_DATE"
 	StateAwaitingTheater   ChatState = "AWAITING_THEATER"
-	StateAwaitingTime      ChatState = "AWAITING_TIME"
+	StateAwaitingShowID    ChatState = "AWAITING_SHOW_ID"
 	StateAwaitingFrequency ChatState = "AWAITING_FREQUENCY"
 	StateMonitoring        ChatState = "MONITORING"
 )
 
 type UserSession struct {
-	CurrentState ChatState
-	City         string
-	Movie        string
-	Date         string
-	Theater      string
-	Time         string
-	Frequency    time.Duration
-	TargetURL    string
+	CurrentState  ChatState
+	City          string
+	Movie         string
+	EventCode     string
+	Date          string
+	Theater       string
+	ShowID        string
+	Frequency     time.Duration
+	TargetURL     string
+	CancelMonitor context.CancelFunc
 }
 
 var (
-	sessionStore       = make(map[string]*UserSession)
-	sessionMutex       sync.Mutex
-	waClient           *whatsmeow.Client
-	currentPairingCode = "Initializing..."
-	pairingCodeMutex   sync.RWMutex
+	client       *whatsmeow.Client
+	sessionStore = make(map[string]*UserSession)
+	sessionMutex sync.Mutex
 )
 
 func main() {
+	// ==========================================
+	// CONFIG FOR LOCAL TESTING
+	// ==========================================
+	dbURL := "postgresql://postgres.lbcryawiflxbygamfdbn:Icelovesme@278727@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres"
+
+
+	cleanPhone := "917989061601"
+
 	ctx := context.Background()
-
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
-	}
-
-	// 1. Initialize Supabase SQL Store for session persistence
-	dbLog := waLog.Stdout("Database", "ERROR", true)
+	dbLog := waLog.Stdout("Database", "Error", true)
 	container, err := sqlstore.New(ctx, "postgres", dbURL, dbLog)
 	if err != nil {
 		log.Fatalf("Failed to connect to Supabase: %v", err)
@@ -76,253 +72,166 @@ func main() {
 
 	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
-		log.Fatalf("Failed to fetch device store: %v", err)
+		log.Fatalf("Failed to get device store: %v", err)
 	}
 
-	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
-	waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	clientLog := waLog.Stdout("Client", "Info", true)
+	client = whatsmeow.NewClient(deviceStore, clientLog)
+	client.AddEventHandler(handleWhatsAppEvent)
 
-	waClient.AddEventHandler(func(evt interface{}) {
-		go handleWhatsAppEvent(evt)
-	})
-
-	// 2. Connect properly based on whether session exists
-	if waClient.Store.ID == nil {
-		phoneNum := os.Getenv("WHATSAPP_PHONE_NUMBER")
-		reg := regexp.MustCompile("[^0-9]")
-		cleanPhone := reg.ReplaceAllString(phoneNum, "")
-
-		if cleanPhone == "" {
-			log.Fatal("WHATSAPP_PHONE_NUMBER environment variable is required (e.g. 917989061601)")
-		}
-
-		err = waClient.Connect()
+	if client.Store.ID == nil {
+		err = client.Connect()
 		if err != nil {
-			log.Fatalf("Failed to connect to WhatsApp: %v", err)
+			log.Fatalf("Failed to connect: %v", err)
 		}
 
-		time.Sleep(2 * time.Second)
-
-		code, err := waClient.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		pairingCode, err := client.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Windows)")
 		if err != nil {
-			log.Fatalf("Failed to generate pairing code: %v", err)
+			log.Fatalf("Failed to get pairing code: %v", err)
 		}
-
-		pairingCodeMutex.Lock()
-		currentPairingCode = code
-		pairingCodeMutex.Unlock()
-
-		log.Println("==================================================")
-		log.Printf("🔥 YOUR 8-DIGIT PAIRING CODE IS: %s 🔥", code)
-		log.Println("==================================================")
+		log.Printf("[+] WhatsApp Pairing Code: %s", pairingCode)
 	} else {
-		// ALREADY PAIRED: Just connect directly without trying to pair again!
-		err = waClient.Connect()
+		err = client.Connect()
 		if err != nil {
-			log.Fatalf("Failed to reconnect WhatsApp: %v", err)
+			log.Fatalf("Failed to connect: %v", err)
 		}
-		pairingCodeMutex.Lock()
-		currentPairingCode = "✅ Connected & Authenticated"
-		pairingCodeMutex.Unlock()
-		log.Println("[+] WhatsApp client reconnected successfully using Supabase session.")
+		log.Println("[+] WhatsApp client reconnected successfully.")
 	}
 
-	// 3. HTTP Health & Status Server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		pairingCodeMutex.RLock()
-		displayCode := currentPairingCode
-		pairingCodeMutex.RUnlock()
-
-		html := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head><meta name="viewport" content="width=device-width, initial-scale=1"><title>BMS Monitor WhatsApp</title></head>
-<body style="font-family: sans-serif; text-align: center; padding: 40px; background: #f0f2f5;">
-    <div style="background: white; max-width: 450px; margin: auto; padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h2 style="color: #128C7E;">🎬 BMS Monitor Status</h2>
-        <div style="background: #e7fce3; padding: 15px; border-radius: 8px; font-size: 24px; font-weight: bold; color: #075E54;">%s</div>
-    </div>
-</body>
-</html>`, displayCode)
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(html))
-	})
-
-	go func() {
-		log.Printf("Server listening on :%s", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
-			log.Printf("HTTP server terminated: %v", err)
-		}
-	}()
-
-	// Graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
-
-	waClient.Disconnect()
-	log.Println("Shutting down gracefully...")
+	log.Printf("Server listening on :%s", port)
+	select {}
 }
 
 func handleWhatsAppEvent(evt interface{}) {
-	// DEBUG: Log every single event type that arrives from WhatsApp
-	log.Printf("[DEBUG EVENT RECEIVED] Type: %T", evt)
-
 	switch v := evt.(type) {
-	case *events.PairSuccess:
-		log.Printf("[+] Device successfully linked: %s", v.ID.String())
-		pairingCodeMutex.Lock()
-		currentPairingCode = "✅ Paired & Connected!"
-		pairingCodeMutex.Unlock()
-
 	case *events.Connected:
 		log.Println("[+] WhatsApp WebSocket connection active.")
 
 	case *events.Message:
-		// Let's print out who sent it and what the message is, regardless of 'IsFromMe'
 		sender := v.Info.Sender.String()
 		text := v.Message.GetConversation()
 		if text == "" && v.Message.GetExtendedTextMessage() != nil {
 			text = v.Message.GetExtendedTextMessage().GetText()
 		}
-		log.Printf("[INCOMING MESSAGE] From: %s | Text: '%s' | IsFromMe: %v", sender, text, v.Info.IsFromMe)
-
-		// If messaging yourself from the linked phone, allow it for testing purposes
+		
 		userJID := v.Info.Sender.ToNonAD().String()
 		msgText := strings.TrimSpace(text)
 		if msgText == "" {
 			return
 		}
 
+		log.Printf("[INCOMING MESSAGE] From: %s | Text: '%s'", sender, msgText)
+
 		sessionMutex.Lock()
 		session, exists := sessionStore[userJID]
-		if !exists || strings.ToLower(msgText) == "hi" || strings.ToLower(msgText) == "restart" {
+		if !exists || strings.ToLower(msgText) == "restart" {
 			session = &UserSession{CurrentState: StateStart}
 			sessionStore[userJID] = session
 		}
 		sessionMutex.Unlock()
 
-		reply := processState(userJID, session, msgText)
-		sendWhatsAppMessage(v.Info.Sender.ToNonAD(), reply)
+		reply := processState(userJID, session, msgText, v.Info.Sender)
+		if reply != "" {
+			sendWhatsAppMessage(v.Info.Sender.ToNonAD(), reply)
+		}
 	}
 }
 
-func processState(userJID string, session *UserSession, input string) string {
+func processState(userJID string, session *UserSession, input string, sender types.JID) string {
 	switch session.CurrentState {
-
 	case StateStart:
 		session.CurrentState = StateAwaitingCity
-		return "Welcome to BMS Monitor! 🎬\n\nPlease enter your city name (e.g., Hyderabad, Mumbai) to find what's playing nearby:"
+		return "🎬 *Welcome to BMS Seat Monitor Bot!*\n\nLet's set up your tracker.\n\nReply with your City (e.g., Hyderabad, Bangalore, Vizag):"
 
 	case StateAwaitingCity:
 		session.City = input
 		session.CurrentState = StateAwaitingMovie
-		return fmt.Sprintf("📍 Location set to: %s.\n\nType the exact movie name you want to watch:", session.City)
+		return fmt.Sprintf("City set to: *%s* 📍\n\nNow enter the Movie Name you want to watch (e.g., DC):", session.City)
 
 	case StateAwaitingMovie:
 		session.Movie = input
+		session.CurrentState = StateAwaitingEventCode
+		return fmt.Sprintf("Movie: *%s* 🎥\n\nEnter the BookMyShow Movie Event Code (e.g., ET00511463):", session.Movie)
+
+	case StateAwaitingEventCode:
+		session.EventCode = input
 		session.CurrentState = StateAwaitingDate
-		return fmt.Sprintf("Selected Movie: %s 🎥\n\nWhen would you like to watch? Reply with date (YYYYMMDD, e.g. 20260718):", session.Movie)
+		return "Enter the Date in YYYYMMDD format (e.g., 20260816):"
 
 	case StateAwaitingDate:
 		session.Date = input
 		session.CurrentState = StateAwaitingTheater
-		return "Select your preferred cinema / theater name or venue code:"
+		return "Enter your Theater Code (e.g., AMBH):"
 
 	case StateAwaitingTheater:
 		session.Theater = input
-		session.CurrentState = StateAwaitingTime
-		return "Available Showtimes (e.g., 07:15 PM):\n\nPlease type your target time choice:"
+		session.CurrentState = StateAwaitingShowID
+		return "Enter the specific Show/Venue ID (e.g., 116579):"
 
-	case StateAwaitingTime:
-		session.Time = input
+	case StateAwaitingShowID:
+		session.ShowID = input
 		session.CurrentState = StateAwaitingFrequency
-		session.TargetURL = "https://in.bookmyshow.com/movies/hyd/seat-layout/ET00441159/AMBH/115212/" + session.Date
-		return "Perfect. Final step: how often do you want updates sent to your phone?\n\nReply with a number in minutes (e.g., type 5, 15, or 30):"
+		
+		session.TargetURL = fmt.Sprintf("https://in.bookmyshow.com/movies/hyd/seat-layout/%s/%s/%s/%s", 
+			session.EventCode, session.Theater, session.ShowID, session.Date)
+
+		return "Final step: How often do you want updates?\n\nReply with a number in minutes (e.g., type 5, 15, or 30):"
 
 	case StateAwaitingFrequency:
-		mins, err := strconv.Atoi(input)
+		var mins int
+		_, err := fmt.Sscanf(input, "%d", &mins)
 		if err != nil || mins <= 0 {
-			return "Please enter a valid positive number for the tracking frequency in minutes (e.g., 15):"
+			mins = 10
 		}
-
 		session.Frequency = time.Duration(mins) * time.Minute
 		session.CurrentState = StateMonitoring
 
-		targetJID, _ := types.ParseJID(userJID)
-		go startBackgroundMonitor(targetJID, userJID, session)
+		ctx, cancel := context.WithCancel(context.Background())
+		session.CancelMonitor = cancel
+		go startMonitoring(sender, session, ctx)
 
-		return fmt.Sprintf("✅ Configuration Complete!\n\nBMS Monitor is actively tracking seat availability for %s with randomized anti-detection intervals.", session.Movie)
+		return fmt.Sprintf("🚀 *Monitoring Active!*\n\nTarget URL: %s\nChecking every %d minutes. Type *restart* anytime to reset.", session.TargetURL, mins)
 
 	case StateMonitoring:
-		return "I am currently monitoring your target showtime! Type 'restart' anytime to start over."
+		if strings.ToLower(input) == "stop" {
+			if session.CancelMonitor != nil {
+				session.CancelMonitor()
+			}
+			session.CurrentState = StateStart
+			return "⏹️ Monitoring stopped. Send *restart* to begin again."
+		}
+		return "Bot is currently monitoring seats. Type *stop* or *restart*."
 	}
 
-	return "System Error. Type 'restart' to return to step one."
+	return "Send *restart* to begin tracking."
 }
 
-func startBackgroundMonitor(targetJID types.JID, userKey string, session *UserSession) {
-	log.Printf("[+] Starting background tracker loop for user %s with base frequency %v", userKey, session.Frequency)
+func startMonitoring(targetJID types.JID, session *UserSession, ctx context.Context) {
+	ticker := time.NewTicker(session.Frequency)
+	defer ticker.Stop()
 
-	// Immediate first scrape
-	triggerScrapeAndSend(targetJID, session)
+	runScraperAndNotify(targetJID, session)
 
 	for {
-		jitterSeconds := rand.Intn(61) + 60
-		sleepDuration := session.Frequency + (time.Duration(jitterSeconds) * time.Second)
-
-		log.Printf("[Monitor] Next check for %s scheduled in %v (including %ds jitter)", userKey, sleepDuration, jitterSeconds)
-		time.Sleep(sleepDuration)
-
-		sessionMutex.Lock()
-		currentSession, exists := sessionStore[userKey]
-		if !exists || currentSession.CurrentState != StateMonitoring {
-			sessionMutex.Unlock()
-			log.Printf("[-] Stopping monitor routine for user %s.", userKey)
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			runScraperAndNotify(targetJID, session)
 		}
-		sessionMutex.Unlock()
-
-		triggerScrapeAndSend(targetJID, session)
 	}
 }
 
-func triggerScrapeAndSend(targetJID types.JID, session *UserSession) {
-	log.Printf("[Scraper] Running Chromedp engine cycle for: %s | %s", session.Theater, session.Time)
+func runScraperAndNotify(targetJID types.JID, session *UserSession) {
+	log.Printf("[Scraper] Running Chromedp engine for URL: %s", session.TargetURL)
+	matrix := fetchCanvasMatrix(session.TargetURL)
 
-	matrixStr := fetchCanvasMatrix(session.TargetURL)
-
-	runes := []rune(matrixStr)
-	if len(runes) > 1200 {
-		matrixStr = string(runes[:1200]) + "\n...[truncated]"
-	}
-
-	formattedMsg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 %s | ⏰ %s\n\n```\n%s\n```",
-		session.Movie, session.Theater, session.Time, matrixStr)
-
-	// Typing presence simulator
-	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
-	time.Sleep(time.Duration(rand.Intn(3)+3) * time.Second)
-	_ = waClient.SendChatPresence(context.Background(), targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
-
-	sendWhatsAppMessage(targetJID, formattedMsg)
-}
-
-func sendWhatsAppMessage(targetJID types.JID, messageText string) {
-	msg := &waE2E.Message{
-		Conversation: proto.String(messageText),
-	}
-	_, err := waClient.SendMessage(context.Background(), targetJID, msg)
-	if err != nil {
-		log.Printf("[-] Failed to deliver WhatsApp message to %s: %v", targetJID.String(), err)
-		return
-	}
-	log.Printf("[+] Delivered WhatsApp message to %s", targetJID.String())
+	msg := fmt.Sprintf("🎬 *BMS Monitor Update: %s*\n📍 Theater: %s\n\n```\n%s\n```", session.Movie, session.Theater, matrix)
+	sendWhatsAppMessage(targetJID, msg)
 }
 
 func fetchCanvasMatrix(targetURL string) string {
@@ -426,7 +335,13 @@ func fetchCanvasMatrix(targetURL string) string {
 func createChromeContext(parentCtx context.Context) (context.Context, context.CancelFunc) {
 	execPath := os.Getenv("CHROME_PATH")
 	if execPath == "" {
-		execPath = "/usr/bin/chromium-browser"
+		if _, err := os.Stat(`C:\Program Files\Google\Chrome\Application\chrome.exe`); err == nil {
+			execPath = `C:\Program Files\Google\Chrome\Application\chrome.exe`
+		} else if _, err := os.Stat(`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`); err == nil {
+			execPath = `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`
+		} else {
+			execPath = "/usr/bin/chromium-browser"
+		}
 	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -438,8 +353,7 @@ func createChromeContext(parentCtx context.Context) (context.Context, context.Ca
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("single-process", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"), // Hides bot signature from BMS
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 	)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parentCtx, opts...)
@@ -451,4 +365,18 @@ func createChromeContext(parentCtx context.Context) (context.Context, context.Ca
 	}
 
 	return taskCtx, cancel
+}
+
+func sendWhatsAppMessage(recipient types.JID, message string) {
+	if client == nil || !client.IsConnected() {
+		log.Println("[-] WhatsApp client not connected, cannot send message.")
+		return
+	}
+	
+	_, err := client.SendMessage(context.Background(), recipient, &waE2E.Message{
+		Conversation: proto.String(message),
+	})
+	if err != nil {
+		log.Printf("[-] Failed to send WhatsApp message: %v", err)
+	}
 }
